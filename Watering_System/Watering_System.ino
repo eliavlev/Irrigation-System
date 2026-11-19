@@ -26,6 +26,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <TimeLib.h>
+#include <time.h>      // ESP8266 SNTP (fallback clock when Blynk is unreachable)
 //#include <BlynkSimpleEsp8266_SSL.h>
 #include <BlynkSimpleEsp8266.h>
 #include <Wire.h>
@@ -55,6 +56,13 @@ unsigned int port = 8442;
 #define WIFI_CONNECT_TIMEOUT_MS    20000UL   // max wait for WiFi at boot
 #define WIFI_FORCE_RECONNECT_MS   300000UL   // force WiFi.reconnect() after 5 min down
 #define BLYNK_RECONNECT_TIMEOUT_MS  3000UL   // max block per Blynk reconnect attempt
+// Local time zone (POSIX TZ string) used ONLY for the NTP fallback clock, when the
+// Blynk RTC is unreachable. Must match the time zone set in the Blynk RTC widget.
+// Default: Israel (IST/IDT). Examples: "CET-1CEST,M3.5.0,M10.5.0/3" (Central Europe),
+// "EST5EDT,M3.2.0,M11.1.0" (US Eastern), "UTC0".
+#define LOCAL_TZ   "IST-2IDT,M3.4.4/26,M10.5.0"
+#define NTP_SERVER1 "pool.ntp.org"
+#define NTP_SERVER2 "time.google.com"
 #define ON 0
 #define OFF 1
 //#define BLYNK_PRINT Serial
@@ -233,14 +241,20 @@ void setup() {
   //setSyncProvider(getNtpTime);
   //setSyncInterval(300); //Sync to NTP server every 5 minutes
   setSyncInterval(10 * 60); // Sync interval in seconds (10 minutes)
+
+  // Start SNTP in the background as a fallback time source. Blynk RTC stays the
+  // primary source; NTP is only used if the clock is still unset (see EnsureClock()).
+  configTime(0, 0, NTP_SERVER1, NTP_SERVER2);
+  setenv("TZ", LOCAL_TZ, 1);
+  tzset();
   
 // Read default watering time from FLASH
-  StartTime_Valve1=ReadFromFlash("StartMin_v1");
-  StopTime_Valve1=ReadFromFlash("StopMin_v1");
-  StartTime_Valve2=ReadFromFlash("StartMin_v2");
-  StopTime_Valve2=ReadFromFlash("StopMin_v2");
-  StartTime_Valve3=ReadFromFlash("StartMin_v3");
-  StopTime_Valve3=ReadFromFlash("StopMin_v3");
+  StartTime_Valve1=LoadScheduleTime("StartMin_v1", "Start_v1");
+  StopTime_Valve1=LoadScheduleTime("StopMin_v1", "Stop_v1");
+  StartTime_Valve2=LoadScheduleTime("StartMin_v2", "Start_v2");
+  StopTime_Valve2=LoadScheduleTime("StopMin_v2", "Stop_v2");
+  StartTime_Valve3=LoadScheduleTime("StartMin_v3", "Start_v3");
+  StopTime_Valve3=LoadScheduleTime("StopMin_v3", "Stop_v3");
   ReadFromFlash2("WeekV1",WeekDays_Valve1);
   for(int i=0;i<8;i++){
    Serial.print(WeekDays_Valve1[i]);
@@ -535,6 +549,7 @@ void CheckManualTimeouts(){
 void WateringCheck(){
   
   CheckManualTimeouts();
+  EnsureClock();
   display.clearDisplay();
   
   timeVal = hour()*60 + minute();   // minutes since midnight
@@ -743,7 +758,6 @@ int ReadFromFlash(String filename){
           Serial.println(s.toInt());
          } 
         f.close();
-        delay(1000);
         return (s.toInt()); 
         }
           
@@ -752,6 +766,38 @@ int ReadFromFlash(String filename){
   return 2500;   // No SPIFFS / no file yet: 2500 never matches a real time, so the valve stays off
     }
 
+
+// Load a schedule time (minutes since midnight). Falls back to the pre-v11 file,
+// which stored HHMM with midnight as 24xx, converts it and saves it in the new format,
+// so an existing saved schedule survives the firmware update.
+int LoadScheduleTime(const char* newName, const char* oldName){
+  int v = ReadFromFlash(newName);
+  if (v >= 0 && v < 1440) return v;
+
+  int old = ReadFromFlash(oldName);
+  int hh = old / 100, mm = old % 100;
+  if (hh == 24) hh = 0;
+  if (old >= 0 && hh < 24 && mm < 60) {
+    v = hh * 60 + mm;
+    Serial.print("Migrated "); Serial.print(oldName);
+    Serial.print(" -> "); Serial.println(newName);
+    WriteToFlash(newName, v);
+    return v;
+  }
+  return 2500;   // no valid saved time: valve stays off for this slot
+}
+
+// If the clock was never set by the Blynk RTC (e.g. Blynk server unreachable at
+// boot), set it from NTP so the saved schedule can still run.
+void EnsureClock(){
+  if (timeStatus() != timeNotSet) return;
+  time_t utc = time(nullptr);
+  if (utc < 1609459200) return;          // SNTP has no answer yet (before 2021-01-01)
+  struct tm lt;
+  localtime_r(&utc, &lt);
+  setTime(lt.tm_hour, lt.tm_min, lt.tm_sec, lt.tm_mday, lt.tm_mon + 1, lt.tm_year + 1900);
+  Serial.println("Clock set from NTP (Blynk RTC not available)");
+}
 
 // Write START TIME to Flash
 void WriteToFlash(String filename, int timeValue){   
@@ -829,7 +875,6 @@ int ReadFromFlash2(String filename, uint8_t WeekArray[]){
         Serial.println("'");
         f.read((uint8_t *)WeekArray, WEEK_ARRAY_LEN);
         f.close();
-        delay(1000);
         return (1); 
         }
           
