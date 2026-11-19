@@ -218,12 +218,12 @@ void setup() {
   setSyncInterval(10 * 60); // Sync interval in seconds (10 minutes)
   
 // Read default watering time from FLASH
-  StartTime_Valve1=ReadFromFlash("Start_v1");
-  StopTime_Valve1=ReadFromFlash("Stop_v1");
-  StartTime_Valve2=ReadFromFlash("Start_v2");
-  StopTime_Valve2=ReadFromFlash("Stop_v2");
-  StartTime_Valve3=ReadFromFlash("Start_v3");
-  StopTime_Valve3=ReadFromFlash("Stop_v3");
+  StartTime_Valve1=ReadFromFlash("StartMin_v1");
+  StopTime_Valve1=ReadFromFlash("StopMin_v1");
+  StartTime_Valve2=ReadFromFlash("StartMin_v2");
+  StopTime_Valve2=ReadFromFlash("StopMin_v2");
+  StartTime_Valve3=ReadFromFlash("StartMin_v3");
+  StopTime_Valve3=ReadFromFlash("StopMin_v3");
   ReadFromFlash2("WeekV1",WeekDays_Valve1);
   for(int i=0;i<8;i++){
    Serial.print(WeekDays_Valve1[i]);
@@ -328,33 +328,23 @@ BLYNK_WRITE(V1) {  // Get watering scheduling for valve1
   // Process start time
   if (t.hasStartTime())
   {
-   if (t.getStartHour()==0){
-    StartTime_Valve1=24*100+ t.getStartMinute();
-   }
-   else {
-   StartTime_Valve1=t.getStartHour()*100+ t.getStartMinute();
-   }
+   StartTime_Valve1 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
    Serial.print("Start V1: " );
    Serial.println (StartTime_Valve1);
   
   // Write START TIME to Flash
-   WriteToFlash("Start_v1",StartTime_Valve1);
+   WriteToFlash("StartMin_v1",StartTime_Valve1);
    
   }
   // Process stop time
   if (t.hasStopTime())
   {
-   if(t.getStopHour()==0){
-    StopTime_Valve1=24*100+ t.getStopMinute();
-   }
-   else {
-      StopTime_Valve1=t.getStopHour()*100+t.getStopMinute();
-   }
+   StopTime_Valve1 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
    Serial.print("Stop V1: ");
    Serial.println(StopTime_Valve1);
    
    // Write STOP TIME to Flash
-   WriteToFlash("Stop_v1",StopTime_Valve1);
+   WriteToFlash("StopMin_v1",StopTime_Valve1);
     
   }
  
@@ -388,33 +378,23 @@ BLYNK_WRITE(V2) {  // Get watering scheduling for valve2
   // Process start time
   if (t.hasStartTime())
   {
-    if (t.getStartHour()==0){
-    StartTime_Valve2=24*100+ t.getStartMinute();
-   }
-   else {
-   StartTime_Valve2=t.getStartHour()*100+ t.getStartMinute();
-   }
+    StartTime_Valve2 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
    Serial.print("Start V2: " );
    Serial.println (StartTime_Valve2);
   
   // Write START TIME to Flash
-   WriteToFlash("Start_v2",StartTime_Valve2);
+   WriteToFlash("StartMin_v2",StartTime_Valve2);
    
   }
   // Process stop time
   if (t.hasStopTime())
     {
-    if(t.getStopHour()==0){
-    StopTime_Valve2=24*100+ t.getStopMinute();
-    }
-   else {
-      StopTime_Valve2=t.getStopHour()*100+t.getStopMinute();
-     }
+    StopTime_Valve2 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
    Serial.print("Stop V2: ");
    Serial.println(StopTime_Valve2);
 
    // Write STOP TIME to Flash
-   WriteToFlash("Stop_v2",StopTime_Valve2);
+   WriteToFlash("StopMin_v2",StopTime_Valve2);
    }
    
   // Process weekdays (1. Mon, 2. Tue, 3. Wed, ...)
@@ -446,33 +426,23 @@ BLYNK_WRITE(V3) {  // Get watering scheduling for valve3
   // Process start time
   if (t.hasStartTime())
   {
-   if (t.getStartHour()==0){
-    StartTime_Valve3=24*100+ t.getStartMinute();
-   }
-   else {
-   StartTime_Valve3=t.getStartHour()*100+ t.getStartMinute();
-   }
+   StartTime_Valve3 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
    Serial.print("Start V3: " );
    Serial.println (StartTime_Valve3);
   
   // Write START TIME to Flash
-   WriteToFlash("Start_v3",StartTime_Valve3);
+   WriteToFlash("StartMin_v3",StartTime_Valve3);
    
   }
   // Process stop time
   if (t.hasStopTime())
   {
-   if(t.getStopHour()==0){
-    StopTime_Valve3=24*100+ t.getStopMinute();
-   }
-   else {
-      StopTime_Valve3=t.getStopHour()*100+t.getStopMinute();
-   }
+   StopTime_Valve3 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
    Serial.print("Stop V3: ");
    Serial.println(StopTime_Valve3);
   
   // Write STOP TIME to Flash
-   WriteToFlash("Stop_v3",StopTime_Valve3);
+   WriteToFlash("StopMin_v3",StopTime_Valve3);
   
   }
  
@@ -539,12 +509,7 @@ void WateringCheck(){
   CheckManualTimeouts();
   display.clearDisplay();
   
- if (hour()==0){
-    timeVal=24*100+minute(); //if watering is around midnight
-    }
-  else {
-    timeVal=hour()*100+minute();
-  }
+  timeVal = hour()*60 + minute();   // minutes since midnight
   Serial.println("timeval: ");
   Serial.println (timeVal);
   Serial.println("Watering Check Running");
@@ -556,7 +521,7 @@ void WateringCheck(){
     Serial.println("Clock not set yet - scheduled watering disabled");
   }
   // if valve 1=True & current weekday = Active watering days & current time within watering time interval or Manual Button Pressed 
-  if (((clockValid && WeekDays_Valve1[0]==1 && WeekDays_Valve1[weekday()]==1 && timeVal >=StartTime_Valve1 && timeVal<=StopTime_Valve1)and (RainModeState==0)) or (Relay1_buttonState==1)){
+  if (((clockValid && WeekDays_Valve1[0]==1 && InWindow(StartTime_Valve1, StopTime_Valve1, WeekDays_Valve1))and (RainModeState==0)) or (Relay1_buttonState==1)){
     Water(RELAY1,"Valve1");
     Serial.print("Valve 1 Weekday: ");
     Serial.println(weekday());
@@ -571,7 +536,7 @@ void WateringCheck(){
     WidgetLED led1(V5); // Valve 1 register to virtual pin 5
     led1.off();
   }
-  if ((clockValid && WeekDays_Valve2[0]==2 && WeekDays_Valve2[weekday()]==1 && timeVal >=StartTime_Valve2 && timeVal<=StopTime_Valve2 and (RainModeState==0))or (Relay2_buttonState==1)){
+  if ((clockValid && WeekDays_Valve2[0]==2 && InWindow(StartTime_Valve2, StopTime_Valve2, WeekDays_Valve2) and (RainModeState==0))or (Relay2_buttonState==1)){
     Serial.print("Valve 2 Watering: ");
     WidgetLED led2(V6); // Valve 2 register to virtual pin 6
     led2.on();
@@ -584,7 +549,7 @@ void WateringCheck(){
     WidgetLED led2(V6); // Valve 2 register to virtual pin 6
     led2.off();
     }
-  if ((clockValid && WeekDays_Valve3[0]==3 && WeekDays_Valve3[weekday()]==1 && timeVal >=StartTime_Valve3 && timeVal<=StopTime_Valve3 and (RainModeState==0))or (Relay3_buttonState==1)){
+  if ((clockValid && WeekDays_Valve3[0]==3 && InWindow(StartTime_Valve3, StopTime_Valve3, WeekDays_Valve3) and (RainModeState==0))or (Relay3_buttonState==1)){
     Serial.print("Valve 3 Watering: ");
     WidgetLED led3(V7); // Valve 2 register to virtual pin 7
     led3.on();
@@ -603,6 +568,24 @@ void WateringCheck(){
   }
 
   
+
+// True if the current time is inside the [start, stop] window (minutes since midnight,
+// stop inclusive) on a selected day. A window with start > stop crosses midnight
+// (e.g. 23:00-01:30); its after-midnight part belongs to the day it started on.
+bool InWindow(int start, int stop, uint8_t days[]){
+  if (start < 0 || start >= 1440 || stop < 0 || stop >= 1440) return false;  // unset (e.g. 2500 sentinel)
+  int nowMin = hour()*60 + minute();
+  int today = weekday();                         // 1=Sun .. 7=Sat
+  if (start <= stop) {
+    return days[today] == 1 && nowMin >= start && nowMin <= stop;
+  }
+  if (nowMin >= start) return days[today] == 1;  // before midnight
+  if (nowMin <= stop) {                          // after midnight: check the previous day
+    int yesterday = (today == 1) ? 7 : today - 1;
+    return days[yesterday] == 1;
+  }
+  return false;
+}
 
 void Water(int relay, String relayName){
       digitalWrite(relay,ON);           // Turns ON Relay 
