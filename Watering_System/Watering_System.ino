@@ -36,15 +36,16 @@
 #include "FS.h"
 #include <ArduinoOTA.h>
 #include <WidgetRTC.h>
+#include "secrets.h"   // Credentials live here (git-ignored). Copy secrets.h.example to create it.
 
 // You should get Auth Token in the Blynk App.
 // Go to the Project Settings (nut icon).
-char auth[] = "76e1e5bf26954ff9a7dd649ad58543fd";
+char auth[] = SECRET_BLYNK_AUTH;
 
 // Your WiFi credentials.
 // Set password to "" for open networks.
-char ssid[] = "EnterSSID";
-char pass[] = "EnterPassword";
+char ssid[] = SECRET_WIFI_SSID;
+char pass[] = SECRET_WIFI_PASS;
 char server[]= "blynk-cloud.com";
 unsigned int port = 8442;
 
@@ -67,10 +68,6 @@ WiFiUDP Udp;
 
 WidgetRTC rtc;  //Blynk Real Time Clock Widget
 
-BLYNK_CONNECTED() {
-  // Synchronize time on connection
-  rtc.begin();
-}
 
 // Init NTP time 
 ////----------------------------------------------------------------------------------
@@ -98,9 +95,10 @@ int timeVal;
 String soilMoist;
 char phrase[20] ="WiFi connected";
 char digitalTime[25];  // The current time in ISO format is being stored here
-uint8_t WeekDays_Valve1[8]={1,0,0,0,0,0,0,0}; 
-uint8_t WeekDays_Valve2[8]={2,0,0,0,0,0,0,0};
-uint8_t WeekDays_Valve3[8]={3,0,0,0,0,0,0,0};
+#define WEEK_ARRAY_LEN 8   // [0]=valve id, [1..7]=Sun..Sat (TimeLib weekday())
+uint8_t WeekDays_Valve1[WEEK_ARRAY_LEN]={1,0,0,0,0,0,0,0}; 
+uint8_t WeekDays_Valve2[WEEK_ARRAY_LEN]={2,0,0,0,0,0,0,0};
+uint8_t WeekDays_Valve3[WEEK_ARRAY_LEN]={3,0,0,0,0,0,0,0};
 int StartTime_Valve1=0;
 int StartTime_Valve2=0;
 int StartTime_Valve3=0;
@@ -109,12 +107,25 @@ int StopTime_Valve2=0;
 int StopTime_Valve3=0;
 bool spiffsActive = false;
 
-long ManualWaterDuration = 1L;  //Set manual watering duration in minutes
+#define DEFAULT_MANUAL_DURATION_MS (10UL * 60UL * 1000UL)    // used until V19 is received
+unsigned long ManualWaterDuration = DEFAULT_MANUAL_DURATION_MS;  // manual watering duration in ms (set from V19 in minutes)
+unsigned long ManualStart[3] = {0, 0, 0};                        // millis() when each manual run started
 int RainModeState=0;   //Rain Mode Button
 int Relay1_buttonState=0;  //Set default Virtual Button state to OFF by default
 int Relay2_buttonState=0;
 int Relay3_buttonState=0;
 int Relay4_buttonState=0;
+
+BLYNK_CONNECTED() {
+  // Synchronize time on connection
+  rtc.begin();
+  // Push the device's real manual-button states to the server before any syncAll().
+  // Otherwise a stale "1" (e.g. a shut-off sent while offline was lost) would
+  // be synced back and re-open the valve.
+  Blynk.virtualWrite(V21, Relay1_buttonState);
+  Blynk.virtualWrite(V22, Relay2_buttonState);
+  Blynk.virtualWrite(V23, Relay3_buttonState);
+}
 
   
 void setup() {
@@ -148,7 +159,7 @@ void setup() {
   ArduinoOTA.setHostname("WaterESP8266");
 
 // No authentication by default
-  ArduinoOTA.setPassword((const char *)"1234zooz");
+  ArduinoOTA.setPassword((const char *)OTA_PASSWORD);  // define OTA_PASSWORD in secrets.h
  
   ArduinoOTA.onStart([]() {
       Serial.println("Start");
@@ -364,6 +375,9 @@ BLYNK_WRITE(V1) {  // Get watering scheduling for valve1
       WeekDays_Valve1[1]=1;
       Serial.println(String("Day ") + (1) + " is selected");
     }
+  else {
+      WeekDays_Valve1[1]=0;
+    }
 
   WriteToFlash2("WeekV1", WeekDays_Valve1); ////////////////////////////////////////////
   
@@ -418,6 +432,9 @@ BLYNK_WRITE(V2) {  // Get watering scheduling for valve2
   if (t.isWeekdaySelected(7)){     //Blynk Sunday enumeration is 7. Convert to 1.
       WeekDays_Valve2[1]=1;
       Serial.println(String("Day ") + (1) + " is selected");
+    }
+  else {
+      WeekDays_Valve2[1]=0;
     }
 
   WriteToFlash2("WeekV2", WeekDays_Valve2); ////////////////////////////////////////////
@@ -475,45 +492,44 @@ BLYNK_WRITE(V3) {  // Get watering scheduling for valve3
       WeekDays_Valve3[1]=1;
       Serial.println(String("Day ") + (1) + " is selected");
     }
+  else {
+      WeekDays_Valve3[1]=0;
+    }
   WriteToFlash2("WeekV3", WeekDays_Valve3); ////////////////////////////////////////////
   Serial.println();
 }
 
-BLYNK_WRITE(V19){  //Read manual watering duration
-    ManualWaterDuration=param.asInt()*1000*60;
+BLYNK_WRITE(V19){  //Read manual watering duration (minutes)
+    long minutes = param.asInt();
+    ManualWaterDuration = (minutes > 0) ? (unsigned long)minutes * 60UL * 1000UL : DEFAULT_MANUAL_DURATION_MS;
     }
 
 BLYNK_WRITE(V20){  //Read Rain Mode state from Blynk App
     RainModeState=param.asInt();
     }
 
-BLYNK_WRITE(V21){
-    Relay1_buttonState=param.asInt();
-    timer.setTimeout(ManualWaterDuration, ShutOff21);
+// Manual watering buttons. Each press (re)starts the run; the run is ended by
+// CheckManualTimeouts() based on millis(), so no timer slots are consumed.
+void SetManual(int &buttonState, int idx, int value){
+    if (value == 1 && buttonState == 0) ManualStart[idx] = millis();  // start only on OFF->ON, so a resync doesn't extend a run
+    buttonState = (value == 1) ? 1 : 0;
    }
 
-BLYNK_WRITE(V22){
-    Relay2_buttonState=param.asInt();
-    timer.setTimeout(ManualWaterDuration, ShutOff22);
-   }
-BLYNK_WRITE(V23){
-    Relay3_buttonState=param.asInt();
-    timer.setTimeout(ManualWaterDuration, ShutOff23);
-   }
+BLYNK_WRITE(V21){ SetManual(Relay1_buttonState, 0, param.asInt()); }
+BLYNK_WRITE(V22){ SetManual(Relay2_buttonState, 1, param.asInt()); }
+BLYNK_WRITE(V23){ SetManual(Relay3_buttonState, 2, param.asInt()); }
 
-void ShutOff21(){
-  Blynk.virtualWrite(21, 0);
-  Relay1_buttonState=0;
+void ExpireManual(int &buttonState, int idx, int vpin){
+  if (buttonState == 1 && millis() - ManualStart[idx] >= ManualWaterDuration){
+    buttonState = 0;
+    Blynk.virtualWrite(vpin, 0);   // if offline, BLYNK_CONNECTED() resyncs the button on reconnect
+    }
   }
 
-void ShutOff22(){
-  Blynk.virtualWrite(22, 0);
-  Relay2_buttonState=0;
-  }
-
-void ShutOff23(){
-  Blynk.virtualWrite(23, 0);
-  Relay3_buttonState=0;
+void CheckManualTimeouts(){
+  ExpireManual(Relay1_buttonState, 0, V21);
+  ExpireManual(Relay2_buttonState, 1, V22);
+  ExpireManual(Relay3_buttonState, 2, V23);
   }
  
 
@@ -522,6 +538,7 @@ void ShutOff23(){
 //  Date & Time Based watering logic
 void WateringCheck(){
   
+  CheckManualTimeouts();
   display.clearDisplay();
   
  if (hour()==0){
@@ -716,6 +733,7 @@ int ReadFromFlash(String filename){
           
         }
       } 
+  return 2500;   // No SPIFFS / no file yet: 2500 never matches a real time, so the valve stays off
     }
 
 
@@ -757,7 +775,7 @@ void WriteToFlash2(String filename, uint8_t WeekArray[]){
        else {
         Serial.println("Writing to file: ");
         Serial.println(filename);
-        f.write((uint8_t *)WeekArray, sizeof(WeekArray));
+        f.write((uint8_t *)WeekArray, WEEK_ARRAY_LEN);  // sizeof() on a pointer param is 4, not 8
         f.close();
       }
 }
@@ -776,7 +794,7 @@ int ReadFromFlash2(String filename, uint8_t WeekArray[]){
         Serial.print("Contents of file ");
         Serial.print(filename);
         Serial.println("'");
-        f.read((uint8_t *)WeekArray, sizeof(WeekArray));
+        f.read((uint8_t *)WeekArray, WEEK_ARRAY_LEN);
         f.close();
         delay(1000);
         return (1); 
@@ -784,6 +802,7 @@ int ReadFromFlash2(String filename, uint8_t WeekArray[]){
           
         }
       } 
+  return 0;      // No SPIFFS / no file yet: keep the array's default (no days selected)
     }
 
 // void SetTimeZone(){
