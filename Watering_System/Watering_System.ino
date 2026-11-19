@@ -52,6 +52,9 @@ unsigned int port = 8442;
 #define RELAY1 12  //D6
 #define RELAY2 14  //D5  (13=D7 14=D5)
 #define RELAY3 2  //D4
+#define WIFI_CONNECT_TIMEOUT_MS    20000UL   // max wait for WiFi at boot
+#define WIFI_FORCE_RECONNECT_MS   300000UL   // force WiFi.reconnect() after 5 min down
+#define BLYNK_RECONNECT_TIMEOUT_MS  3000UL   // max block per Blynk reconnect attempt
 #define ON 0
 #define OFF 1
 //#define BLYNK_PRINT Serial
@@ -92,7 +95,6 @@ int moistureSensorValue =0;
 int sensorValue=0;
 int timeVal;  
 
-char phrase[20] ="WiFi connected";
 char digitalTime[25];  // The current time in ISO format is being stored here
 #define WEEK_ARRAY_LEN 8   // [0]=valve id, [1..7]=Sun..Sat (TimeLib weekday())
 uint8_t WeekDays_Valve1[WEEK_ARRAY_LEN]={1,0,0,0,0,0,0,0}; 
@@ -194,18 +196,33 @@ void setup() {
   
 // Connecting to a WiFi network
 //--------------------------------------------------------------------
+  // Let the ESP8266 SDK handle reconnects itself, and don't rewrite the
+  // credentials to flash on every boot.
   Serial.print("Connecting to ");
   Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, pass);
-  
-  while (WiFi.status() != WL_CONNECTED) {
+
+  // Wait a bounded time: if the router is down, keep booting so the
+  // controller still runs (manual buttons, saved schedule once time is known).
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
     delay(500);
     Serial.print(".");
    }
-  Serial.println("WiFi connected");
-  Serial.print("IP number assigned by DHCP is:  ");
-  Serial.println(WiFi.localIP());
-  PrintToLCD("WiFi connected",1,20);
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP number assigned by DHCP is:  ");
+    Serial.println(WiFi.localIP());
+    PrintToLCD("WiFi connected",1,20);
+  } else {
+    Serial.println("WiFi not available - continuing offline, will keep retrying");
+    PrintToLCD("WiFi offline",1,20);
+  }
+  display.display();
   delay(2500);
   //Serial.println("Starting UDP");
   //Udp.begin(localPort);
@@ -246,9 +263,12 @@ for(int i=0;i<8;i++){
 // Setup BLYNK code
  // Blynk.begin(auth, ssid, pass);
  Blynk.config(auth, server, port);
- Blynk.connect(10000);
- Serial.println("Connected to Blynk server"); 
- Blynk.syncAll();  
+ if (WiFi.status() == WL_CONNECTED && Blynk.connect(10000)) {
+   Serial.println("Connected to Blynk server");
+   Blynk.syncAll();
+ } else {
+   Serial.println("Blynk server not reachable - will retry in background");
+ }
  //Blynk.syncVirtual(V1);
  //delay (1000);
  //Blynk.syncVirtual(V2);
@@ -299,11 +319,19 @@ void loop() {
 //---------------------------------------------------------------------------------
 // Function Declerations
 //---------------------------------------------------------------------------------
-void CheckConnection(){    // check every 11s if connected to Blynk server
+void CheckConnection(){    // check every 30s if connected to Blynk server
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Blynk check skipped: WiFi not connected");
+    return;                 // no point blocking on a connect attempt without WiFi
+  }
   if(!Blynk.connected()){
     Serial.println("Not connected to Blynk server"); 
-    Blynk.connect();  // try to connect to server with default timeout
-    Blynk.syncAll();
+    if (Blynk.connect(BLYNK_RECONNECT_TIMEOUT_MS)) {   // short timeout so valves/timers aren't stalled
+      Serial.println("Reconnected to Blynk server");
+      Blynk.syncAll();
+    } else {
+      Serial.println("Blynk reconnect failed");
+    }
   }
   else{
     Serial.println("Connected to Blynk server");
@@ -743,13 +771,30 @@ void WriteToFlash(String filename, int timeValue){
 
 // Wifi Status Check
 
+// The SDK auto-reconnects (setAutoReconnect). This only logs state changes and,
+// as a fallback, nudges a reconnect if WiFi has been down for a long time.
+// It never blocks.
 void checkWifiStatus(){
-if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect();
-    delay(500);
-    WiFi.begin(ssid, pass);
-    delay(800);
-   }
+  static bool wasConnected = true;
+  static unsigned long downSince = 0;
+  bool connected = (WiFi.status() == WL_CONNECTED);
+
+  if (connected) {
+    if (!wasConnected) {
+      Serial.print("WiFi reconnected, IP: ");
+      Serial.println(WiFi.localIP());
+    }
+  } else {
+    if (wasConnected) {
+      Serial.println("WiFi connection lost");
+      downSince = millis();
+    } else if (millis() - downSince >= WIFI_FORCE_RECONNECT_MS) {
+      Serial.println("WiFi still down - forcing reconnect");
+      WiFi.reconnect();
+      downSince = millis();
+    }
+  }
+  wasConnected = connected;
 }
 
 // Write Weekdays to Flash
