@@ -92,7 +92,6 @@ int moistureSensorValue =0;
 int sensorValue=0;
 int timeVal;  
 
-String soilMoist;
 char phrase[20] ="WiFi connected";
 char digitalTime[25];  // The current time in ISO format is being stored here
 #define WEEK_ARRAY_LEN 8   // [0]=valve id, [1..7]=Sun..Sat (TimeLib weekday())
@@ -317,7 +316,6 @@ void CheckMoisture(){
   // reads the sensors
   // Using capcitive water sensor Dry=728, Wet=452
   moistureSensorValue = analogRead(moistureSensorPin);
-  soilMoist="Moisture: "+ moistureSensorValue;
   Serial.print("Moisture: ");
   Serial.println(moistureSensorValue);
   Blynk.virtualWrite(V0, moistureSensorValue);
@@ -550,8 +548,15 @@ void WateringCheck(){
   Serial.println("timeval: ");
   Serial.println (timeVal);
   Serial.println("Watering Check Running");
+
+  // Until the Blynk RTC has set the clock, TimeLib reports 1970-01-01 00:00 (a Thursday).
+  // Don't run the schedule on that fake time; manual watering still works.
+  bool clockValid = (timeStatus() != timeNotSet);
+  if (!clockValid) {
+    Serial.println("Clock not set yet - scheduled watering disabled");
+  }
   // if valve 1=True & current weekday = Active watering days & current time within watering time interval or Manual Button Pressed 
-  if (((WeekDays_Valve1[0]==1 && WeekDays_Valve1[weekday()]==1 && timeVal >=StartTime_Valve1 && timeVal<=StopTime_Valve1)and (RainModeState==0)) or (Relay1_buttonState==1)){
+  if (((clockValid && WeekDays_Valve1[0]==1 && WeekDays_Valve1[weekday()]==1 && timeVal >=StartTime_Valve1 && timeVal<=StopTime_Valve1)and (RainModeState==0)) or (Relay1_buttonState==1)){
     Water(RELAY1,"Valve1");
     Serial.print("Valve 1 Weekday: ");
     Serial.println(weekday());
@@ -566,7 +571,7 @@ void WateringCheck(){
     WidgetLED led1(V5); // Valve 1 register to virtual pin 5
     led1.off();
   }
-  if ((WeekDays_Valve2[0]==2 && WeekDays_Valve2[weekday()]==1 && timeVal >=StartTime_Valve2 && timeVal<=StopTime_Valve2 and (RainModeState==0))or (Relay2_buttonState==1)){
+  if ((clockValid && WeekDays_Valve2[0]==2 && WeekDays_Valve2[weekday()]==1 && timeVal >=StartTime_Valve2 && timeVal<=StopTime_Valve2 and (RainModeState==0))or (Relay2_buttonState==1)){
     Serial.print("Valve 2 Watering: ");
     WidgetLED led2(V6); // Valve 2 register to virtual pin 6
     led2.on();
@@ -579,7 +584,7 @@ void WateringCheck(){
     WidgetLED led2(V6); // Valve 2 register to virtual pin 6
     led2.off();
     }
-  if ((WeekDays_Valve3[0]==3 && WeekDays_Valve3[weekday()]==1 && timeVal >=StartTime_Valve3 && timeVal<=StopTime_Valve3 and (RainModeState==0))or (Relay3_buttonState==1)){
+  if ((clockValid && WeekDays_Valve3[0]==3 && WeekDays_Valve3[weekday()]==1 && timeVal >=StartTime_Valve3 && timeVal<=StopTime_Valve3 and (RainModeState==0))or (Relay3_buttonState==1)){
     Serial.print("Valve 3 Watering: ");
     WidgetLED led3(V7); // Valve 2 register to virtual pin 7
     led3.on();
