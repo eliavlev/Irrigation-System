@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Garden Irrigation</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>💧</text></svg>">
+<style>
+  :root {
+    --bg: #f4f6f3; --card: #ffffff; --text: #1d2a1f; --muted: #66746a; --line: #dfe5dc;
+    --accent: #2f7d4f; --accent-ink: #ffffff; --water: #1f6fb2; --warn: #b4531a; --off: #9aa59d;
+    --chip: #eef2ec; --chip-on: #d7ecdf;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121713; --card: #1b221d; --text: #e3ebe4; --muted: #93a197; --line: #2b352e;
+      --accent: #4fae78; --accent-ink: #0e1a12; --water: #5aa9e6; --warn: #e48a4f; --off: #5d6a61;
+      --chip: #232c26; --chip-on: #24432f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.35rem; margin: 4px 0 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .pill { font-size: .75rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .pill.ok { background: var(--chip-on); color: var(--accent); }
+  .pill.bad { color: var(--warn); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .stat .k { font-size: .75rem; color: var(--muted); }
+  .stat .v { font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .valve-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .valve-head h2 { font-size: 1.05rem; margin: 0; }
+  .badge { font-size: .8rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--off); }
+  .badge.on { background: var(--water); color: #fff; }
+  label { font-size: .8rem; color: var(--muted); display: block; margin-bottom: 4px; }
+  input[type=time], input[type=number], input[type=text], input[type=password] {
+    font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px; width: 100%; }
+  .times { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+  .days { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .day { border: 1px solid var(--line); background: var(--chip); color: var(--muted); border-radius: 8px;
+         padding: 6px 0; width: 44px; text-align: center; font-size: .85rem; cursor: pointer; user-select: none; }
+  .day.on { background: var(--chip-on); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 10px; padding: 9px 16px; cursor: pointer;
+           background: var(--accent); color: var(--accent-ink); }
+  button.secondary { background: var(--chip); color: var(--text); border: 1px solid var(--line); }
+  button.water { background: var(--water); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .switch { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .switch input { width: 20px; height: 20px; accent-color: var(--accent); }
+  .muted { color: var(--muted); font-size: .85rem; }
+  .saved { color: var(--accent); font-size: .85rem; }
+  #login .grid { display: grid; gap: 10px; margin-bottom: 12px; }
+  .hidden { display: none !important; }
+  @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, 1fr); } .day { width: 38px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>💧 Garden Irrigation <span id="conn" class="pill">Disconnected</span> <span id="dev" class="pill hidden">Device offline</span></h1>
+
+  <section id="login" class="card">
+    <div class="grid">
+      <div><label for="user">Username</label><input id="user" type="text" autocomplete="username" value="web"></div>
+      <div><label for="pass">Password</label><input id="pass" type="password" autocomplete="current-password"></div>
+      <label class="switch"><input id="remember" type="checkbox" checked> Remember on this device</label>
+    </div>
+    <button id="connectBtn">Connect</button>
+    <span id="loginMsg" class="muted"></span>
+  </section>
+
+  <section id="app" class="hidden">
+    <div class="card">
+      <div class="stats">
+        <div class="stat"><div class="k">Device time</div><div class="v" id="sTime">–</div></div>
+        <div class="stat"><div class="k">Soil moisture (raw)</div><div class="v" id="sMoist">–</div></div>
+        <div class="stat"><div class="k">WiFi signal</div><div class="v" id="sRssi">–</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label class="switch" style="margin:0;color:var(--text);font-size:1rem">
+          <input id="rain" type="checkbox"> Rain mode <span class="muted">(pause schedules)</span>
+        </label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span class="muted">Manual run</span>
+          <input id="manualMin" type="number" min="1" max="240" style="width:80px">
+          <span class="muted">min</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="valves"></div>
+    <p class="muted">Schedules are stored on the controller and keep running when it is offline.
+      A stop time earlier than the start time runs past midnight. <a href="#" id="logout">Log out</a></p>
+  </section>
+</main>
+
+<template id="valveTpl">
+  <div class="card valve">
+    <div class="valve-head">
+      <h2></h2>
+      <span class="badge">Off</span>
+    </div>
+    <div class="times">
+      <div><label>Start</label><input type="time" class="start"></div>
+      <div><label>Stop</label><input type="time" class="stop"></div>
+    </div>
+    <div class="days"></div>
+    <div class="row">
+      <div class="actions">
+        <button class="save">Save schedule</button>
+        <button class="secondary clear">Clear</button>
+        <span class="saved"></span>
+      </div>
+      <button class="water manual">Water now</button>
+    </div>
+  </div>
+</template>
+
+<script src="mqtt.min.js"></script>
+<script>
+const DEVICE = "garden";
+const BASE = `irrigation/${DEVICE}`;
+const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const $ = (id) => document.getElementById(id);
+let client = null;
+let state = null;
+const dirty = [false, false, false];
+
+function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+
+const toHHMM = (m) => m < 0 ? "" : String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+const toMin = (s) => { if (!s) return -1; const [h, m] = s.split(":").map(Number); return h * 60 + m; };
+
+// ---- build valve cards
+const valveEls = [];
+for (let i = 0; i < 3; i++) {
+  const el = $("valveTpl").content.firstElementChild.cloneNode(true);
+  el.querySelector("h2").textContent = `Valve ${i + 1}`;
+  const daysEl = el.querySelector(".days");
+  DAYS.forEach((d, idx) => {
+    const b = document.createElement("div");
+    b.className = "day"; b.textContent = d; b.dataset.idx = idx;
+    b.onclick = () => { b.classList.toggle("on"); markDirty(i); };
+    daysEl.appendChild(b);
+  });
+  el.querySelectorAll("input[type=time]").forEach(inp => inp.addEventListener("input", () => markDirty(i)));
+  el.querySelector(".save").onclick = () => saveSchedule(i);
+  el.querySelector(".clear").onclick = () => {
+    el.querySelector(".start").value = ""; el.querySelector(".stop").value = "";
+    el.querySelectorAll(".day").forEach(d => d.classList.remove("on"));
+    markDirty(i);
+  };
+  el.querySelector(".manual").onclick = () => {
+    const on = state && state.valves[i].manual;
+    publish(`${BASE}/set/valve/${i + 1}/manual`, on ? "0" : "1", false);
+  };
+  $("valves").appendChild(el);
+  valveEls.push(el);
+}
+
+function markDirty(i) { dirty[i] = true; valveEls[i].querySelector(".saved").textContent = "Unsaved"; }
+
+function saveSchedule(i) {
+  const el = valveEls[i];
+  const start = toMin(el.querySelector(".start").value);
+  const stop = toMin(el.querySelector(".stop").value);
+  if ((start < 0) !== (stop < 0)) { el.querySelector(".saved").textContent = "Set both times, or clear both"; return; }
+  const days = [...el.querySelectorAll(".day")].map(d => d.classList.contains("on") ? 1 : 0);
+  publish(`${BASE}/set/valve/${i + 1}/schedule`, JSON.stringify({ start, stop, days }), true);
+  dirty[i] = false;
+  el.querySelector(".saved").textContent = "Saved ✓";
+}
+
+function publish(topic, payload, retain) {
+  if (!client || !client.connected) return;
+  client.publish(topic, payload, { qos: 1, retain });
+}
+
+function render() {
+  if (!state) return;
+  $("sTime").textContent = state.time ? state.time.slice(11) : "not set";
+  $("sMoist").textContent = state.moisture;
+  $("sRssi").textContent = state.rssi + " dBm";
+  $("rain").checked = !!state.rain;
+  if (document.activeElement !== $("manualMin")) $("manualMin").value = state.manual_minutes;
+  state.valves.forEach((v, i) => {
+    const el = valveEls[i];
+    const badge = el.querySelector(".badge");
+    badge.classList.toggle("on", v.on);
+    badge.textContent = v.on ? (v.manual ? `Manual · ${Math.ceil(v.manual_left / 60)} min left` : "Watering") : "Off";
+    el.querySelector(".manual").textContent = v.manual ? "Stop" : "Water now";
+    if (!dirty[i]) {
+      el.querySelector(".start").value = toHHMM(v.start);
+      el.querySelector(".stop").value = toHHMM(v.stop);
+      el.querySelectorAll(".day").forEach((d, idx) => d.classList.toggle("on", !!v.days[idx]));
+    }
+  });
+}
+
+$("rain").onchange = (e) => publish(`${BASE}/set/rain`, e.target.checked ? "1" : "0", true);
+$("manualMin").onchange = (e) => {
+  const m = parseInt(e.target.value, 10);
+  if (m > 0 && m <= 240) publish(`${BASE}/set/manual_minutes`, String(m), true);
+};
+
+function setConn(text, cls) { const c = $("conn"); c.textContent = text; c.className = "pill " + (cls || ""); }
+
+function connect(user, pass) {
+  if (client) client.end(true);
+  setConn("Connecting…");
+  $("loginMsg").textContent = "";
+  const url = `wss://${location.host}/mqtt`;
+  client = mqtt.connect(url, { username: user, password: pass, reconnectPeriod: 5000, connectTimeout: 10000,
+                               clientId: "web-" + Math.random().toString(16).slice(2, 10) });
+  client.on("connect", () => {
+    setConn("Connected", "ok");
+    $("login").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    client.subscribe([`${BASE}/state`, `${BASE}/status`], { qos: 1 });
+  });
+  client.on("message", (topic, msg) => {
+    const s = msg.toString();
+    if (topic.endsWith("/status")) {
+      const dev = $("dev");
+      dev.classList.remove("hidden");
+      dev.textContent = s === "online" ? "Device online" : "Device offline";
+      dev.className = "pill " + (s === "online" ? "ok" : "bad");
+    } else if (topic.endsWith("/state")) {
+      try { state = JSON.parse(s); render(); } catch (e) {}
+    }
+  });
+  client.on("error", (err) => {
+    setConn("Error", "bad");
+    $("loginMsg").textContent = /auth|Not authorized|Bad user/i.test(err.message) ? "Wrong username or password" : err.message;
+    if (/auth|Not authorized|Bad user/i.test(err.message)) { client.end(true); store("irr.pass", null); }
+  });
+  client.on("close", () => setConn("Disconnected", "bad"));
+}
+
+$("connectBtn").onclick = () => {
+  const user = $("user").value.trim(), pass = $("pass").value;
+  if ($("remember").checked) { store("irr.user", user); store("irr.pass", pass); }
+  connect(user, pass);
+};
+$("logout").onclick = (e) => {
+  e.preventDefault(); store("irr.pass", null);
+  if (client) client.end(true);
+  $("app").classList.add("hidden"); $("login").classList.remove("hidden"); setConn("Disconnected");
+};
+
+const savedUser = load("irr.user"), savedPass = load("irr.pass");
+if (savedUser) $("user").value = savedUser;
+if (savedUser && savedPass) connect(savedUser, savedPass);
+</script>
+</body>
+</html>
