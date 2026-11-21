@@ -1,0 +1,26 @@
+[Unit]
+Description=Irrigation dashboard login service
+After=network.target
+
+[Service]
+User=irrigation
+Group=irrigation
+EnvironmentFile=/etc/irrigation/auth.env
+ExecStart=/usr/bin/python3 /opt/irrigation/auth.py serve
+Restart=on-failure
+StateDirectory=irrigation
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

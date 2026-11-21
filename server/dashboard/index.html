@@ -27,18 +27,25 @@
   .pill.ok { background: var(--chip-on); color: var(--accent); }
   .pill.bad { color: var(--warn); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; margin-bottom: 12px; }
-  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  /* Device time, soil moisture and WiFi signal on one compact line */
+  .card.stats-card { padding: 10px 14px; }
+  .stats { display: flex; justify-content: space-between; gap: 10px; flex-wrap: nowrap; white-space: nowrap; }
+  .stat { display: flex; align-items: baseline; gap: 5px; min-width: 0; }
   .stat .k { font-size: .75rem; color: var(--muted); }
-  .stat .v { font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .v { font-size: .95rem; font-weight: 600; font-variant-numeric: tabular-nums; }
   .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
   .valve-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
   .valve-head h2 { font-size: 1.05rem; margin: 0; }
   .badge { font-size: .8rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; background: var(--chip); color: var(--off); }
   .badge.on { background: var(--water); color: #fff; }
   label { font-size: .8rem; color: var(--muted); display: block; margin-bottom: 4px; }
-  input[type=time], input[type=number], input[type=text], input[type=password] {
+  input[type=number], input[type=text], input[type=password] {
     font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
     border-radius: 8px; padding: 8px 10px; width: 100%; }
+  .tsel { display: flex; align-items: center; gap: 6px; }
+  .tsel span { font-weight: 600; color: var(--muted); }
+  .tsel select { font: inherit; font-variant-numeric: tabular-nums; color: var(--text); background: var(--bg);
+                 border: 1px solid var(--line); border-radius: 8px; padding: 8px 6px; flex: 1; min-width: 0; text-align: center; }
   .times { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
   .days { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
   .day { border: 1px solid var(--line); background: var(--chip); color: var(--muted); border-radius: 8px;
@@ -50,35 +57,57 @@
   button.water { background: var(--water); color: #fff; }
   button:disabled { opacity: .5; cursor: default; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Save / Clear / Water now always share one row, even on a phone */
+  .valve-actions { display: flex; gap: 8px; flex-wrap: nowrap; }
+  .valve-actions button { flex: 1 1 auto; white-space: nowrap; padding: 10px 10px; font-size: .9rem; }
+  .valve-actions .clear { flex: 0 1 auto; }
+  .valve .saved { display: block; min-height: 1.2em; margin-top: 6px; }
   .switch { display: flex; align-items: center; gap: 10px; cursor: pointer; }
   .switch input { width: 20px; height: 20px; accent-color: var(--accent); }
   .muted { color: var(--muted); font-size: .85rem; }
   .saved { color: var(--accent); font-size: .85rem; }
-  #login .grid { display: grid; gap: 10px; margin-bottom: 12px; }
+  form .grid { display: grid; gap: 10px; margin-bottom: 12px; }
+  #loginMsg, #pwMsg { display: block; margin-top: 8px; color: var(--warn); }
+  a { color: var(--accent); }
   .hidden { display: none !important; }
-  @media (max-width: 420px) { .stats { grid-template-columns: repeat(2, 1fr); } .day { width: 38px; } }
+  @media (max-width: 420px) { .day { width: 38px; } }
 </style>
 </head>
 <body>
 <main>
   <h1>💧 Garden Irrigation <span id="conn" class="pill">Disconnected</span> <span id="dev" class="pill hidden">Device offline</span></h1>
 
-  <section id="login" class="card">
+  <form id="login" class="card hidden">
     <div class="grid">
-      <div><label for="user">Username</label><input id="user" type="text" autocomplete="username" value="web"></div>
-      <div><label for="pass">Password</label><input id="pass" type="password" autocomplete="current-password"></div>
-      <label class="switch"><input id="remember" type="checkbox" checked> Remember on this device</label>
+      <div><label for="user">Username</label><input id="user" type="text" autocomplete="username" autocapitalize="none" required></div>
+      <div><label for="pass">Password</label><input id="pass" type="password" autocomplete="current-password" required></div>
     </div>
-    <button id="connectBtn">Connect</button>
+    <button type="submit">Log in</button>
     <span id="loginMsg" class="muted"></span>
-  </section>
+  </form>
+
+  <form id="pwForm" class="card hidden">
+    <h2 style="font-size:1.05rem;margin:0 0 6px">Change password</h2>
+    <p id="pwNote" class="muted" style="margin:0 0 10px"></p>
+    <div class="grid">
+      <input type="text" autocomplete="username" id="pwUser" class="hidden" tabindex="-1" aria-hidden="true">
+      <div><label for="pwCur">Current password</label><input id="pwCur" type="password" autocomplete="current-password" required></div>
+      <div><label for="pwNew">New password (at least 8 characters)</label><input id="pwNew" type="password" autocomplete="new-password" minlength="8" required></div>
+      <div><label for="pwNew2">Repeat new password</label><input id="pwNew2" type="password" autocomplete="new-password" minlength="8" required></div>
+    </div>
+    <div class="actions">
+      <button type="submit">Change password</button>
+      <button type="button" class="secondary" id="pwCancel">Cancel</button>
+    </div>
+    <span id="pwMsg" class="muted"></span>
+  </form>
 
   <section id="app" class="hidden">
-    <div class="card">
+    <div class="card stats-card">
       <div class="stats">
-        <div class="stat"><div class="k">Device time</div><div class="v" id="sTime">–</div></div>
-        <div class="stat"><div class="k">Soil moisture (raw)</div><div class="v" id="sMoist">–</div></div>
-        <div class="stat"><div class="k">WiFi signal</div><div class="v" id="sRssi">–</div></div>
+        <div class="stat" title="Device time"><span class="k">Time</span><span class="v" id="sTime">–</span></div>
+        <div class="stat" title="Soil moisture (raw sensor value)"><span class="k">Soil</span><span class="v" id="sMoist">–</span></div>
+        <div class="stat" title="WiFi signal strength"><span class="k">WiFi</span><span class="v" id="sRssi">–</span></div>
       </div>
     </div>
 
@@ -97,7 +126,8 @@
 
     <div id="valves"></div>
     <p class="muted">Schedules are stored on the controller and keep running when it is offline.
-      A stop time earlier than the start time runs past midnight. <a href="#" id="logout">Log out</a></p>
+      A stop time earlier than the start time runs past midnight.</p>
+    <p class="muted">Signed in as <b id="whoami"></b> · <a href="#" id="changePw">Change password</a> · <a href="#" id="logout">Log out</a></p>
   </section>
 </main>
 
@@ -108,18 +138,15 @@
       <span class="badge">Off</span>
     </div>
     <div class="times">
-      <div><label>Start</label><input type="time" class="start"></div>
-      <div><label>Stop</label><input type="time" class="stop"></div>
+      <div><label>Start</label><div class="tsel"><select class="start-h" aria-label="Start hour"></select><span>:</span><select class="start-m" aria-label="Start minute"></select></div></div>
+      <div><label>Stop</label><div class="tsel"><select class="stop-h" aria-label="Stop hour"></select><span>:</span><select class="stop-m" aria-label="Stop minute"></select></div></div>
     </div>
     <div class="days"></div>
-    <div class="row">
-      <div class="actions">
-        <button class="save">Save schedule</button>
-        <button class="secondary clear">Clear</button>
-        <span class="saved"></span>
-      </div>
+    <div class="valve-actions">
+      <button class="secondary clear">Clear</button>
       <button class="water manual">Water now</button>
     </div>
+    <span class="saved"></span>
   </div>
 </template>
 
@@ -136,8 +163,21 @@ const dirty = [false, false, false];
 function store(k, v) { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch (e) {} }
 function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
 
-const toHHMM = (m) => m < 0 ? "" : String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
-const toMin = (s) => { if (!s) return -1; const [h, m] = s.split(":").map(Number); return h * 60 + m; };
+const pad = (n) => String(n).padStart(2, "0");
+
+// Hour (00-23) and minute (00-59) pickers; "--" means no time set.
+function fillTimeSelect(sel, count) {
+  sel.add(new Option("--", ""));
+  for (let n = 0; n < count; n++) sel.add(new Option(pad(n), String(n)));
+}
+function getTime(el, which) {
+  const h = el.querySelector(`.${which}-h`).value, m = el.querySelector(`.${which}-m`).value;
+  return h === "" ? -1 : Number(h) * 60 + Number(m || 0);
+}
+function setTime(el, which, mins) {
+  el.querySelector(`.${which}-h`).value = mins < 0 ? "" : String(Math.floor(mins / 60));
+  el.querySelector(`.${which}-m`).value = mins < 0 ? "" : String(mins % 60);
+}
 
 // ---- build valve cards
 const valveEls = [];
@@ -151,10 +191,21 @@ for (let i = 0; i < 3; i++) {
     b.onclick = () => { b.classList.toggle("on"); markDirty(i); };
     daysEl.appendChild(b);
   });
-  el.querySelectorAll("input[type=time]").forEach(inp => inp.addEventListener("input", () => markDirty(i)));
-  el.querySelector(".save").onclick = () => saveSchedule(i);
+  ["start", "stop"].forEach(which => {
+    const h = el.querySelector(`.${which}-h`), m = el.querySelector(`.${which}-m`);
+    fillTimeSelect(h, 24); fillTimeSelect(m, 60);
+    h.addEventListener("change", () => {
+      if (h.value === "") m.value = ""; else if (m.value === "") m.value = "0";   // picking an hour defaults minutes to :00
+      markDirty(i);
+    });
+    m.addEventListener("change", () => {
+      if (m.value !== "" && h.value === "") h.value = "0";
+      if (m.value === "") h.value = "";
+      markDirty(i);
+    });
+  });
   el.querySelector(".clear").onclick = () => {
-    el.querySelector(".start").value = ""; el.querySelector(".stop").value = "";
+    setTime(el, "start", -1); setTime(el, "stop", -1);
     el.querySelectorAll(".day").forEach(d => d.classList.remove("on"));
     markDirty(i);
   };
@@ -166,17 +217,45 @@ for (let i = 0; i < 3; i++) {
   valveEls.push(el);
 }
 
-function markDirty(i) { dirty[i] = true; valveEls[i].querySelector(".saved").textContent = "Unsaved"; }
+// ---- schedules save automatically: a short pause after the last change, then publish.
+// dirty[i] stays true (so incoming device state doesn't overwrite the form) until the
+// controller reports the schedule we sent.
+const saveTimers = [null, null, null];
+const pending = [null, null, null];
+const statusOf = (i) => valveEls[i].querySelector(".saved");
 
-function saveSchedule(i) {
+function markDirty(i) {
+  dirty[i] = true;
+  pending[i] = null;
+  clearTimeout(saveTimers[i]);
+  saveTimers[i] = setTimeout(() => autoSave(i), 600);
+}
+
+function autoSave(i) {
   const el = valveEls[i];
-  const start = toMin(el.querySelector(".start").value);
-  const stop = toMin(el.querySelector(".stop").value);
-  if ((start < 0) !== (stop < 0)) { el.querySelector(".saved").textContent = "Set both times, or clear both"; return; }
+  const start = getTime(el, "start");
+  const stop = getTime(el, "stop");
+  if (start >= 0 && stop < 0) { statusOf(i).textContent = "Set a stop time to save"; return; }
+  if (stop >= 0 && start < 0) { statusOf(i).textContent = "Set a start time to save"; return; }
+  if (!client || !client.connected) { statusOf(i).textContent = "Not connected - will save when reconnected"; return; }
   const days = [...el.querySelectorAll(".day")].map(d => d.classList.contains("on") ? 1 : 0);
-  publish(`${BASE}/set/valve/${i + 1}/schedule`, JSON.stringify({ start, stop, days }), true);
+  pending[i] = { start, stop, days };
+  publish(`${BASE}/set/valve/${i + 1}/schedule`, JSON.stringify(pending[i]), true);
+  statusOf(i).textContent = "Saving…";
+  clearTimeout(saveTimers[i]);
+  saveTimers[i] = setTimeout(() => {
+    if (pending[i]) statusOf(i).textContent = "Saved - the controller will apply it when it is online";
+  }, 5000);
+}
+
+function confirmSaved(i, v) {
+  const p = pending[i];
+  if (!p || p.start !== v.start || p.stop !== v.stop || p.days.some((d, k) => d !== v.days[k])) return;
+  pending[i] = null;
   dirty[i] = false;
-  el.querySelector(".saved").textContent = "Saved ✓";
+  clearTimeout(saveTimers[i]);
+  statusOf(i).textContent = "Saved ✓";
+  saveTimers[i] = setTimeout(() => { if (!dirty[i]) statusOf(i).textContent = ""; }, 3000);
 }
 
 function publish(topic, payload, retain) {
@@ -197,9 +276,10 @@ function render() {
     badge.classList.toggle("on", v.on);
     badge.textContent = v.on ? (v.manual ? `Manual · ${Math.ceil(v.manual_left / 60)} min left` : "Watering") : "Off";
     el.querySelector(".manual").textContent = v.manual ? "Stop" : "Water now";
+    confirmSaved(i, v);
     if (!dirty[i]) {
-      el.querySelector(".start").value = toHHMM(v.start);
-      el.querySelector(".stop").value = toHHMM(v.stop);
+      setTime(el, "start", v.start);
+      setTime(el, "stop", v.stop);
       el.querySelectorAll(".day").forEach((d, idx) => d.classList.toggle("on", !!v.days[idx]));
     }
   });
@@ -213,18 +293,59 @@ $("manualMin").onchange = (e) => {
 
 function setConn(text, cls) { const c = $("conn"); c.textContent = text; c.className = "pill " + (cls || ""); }
 
-function connect(user, pass) {
+// ---- screens: "login" | "password" | "app"
+let me = null;
+function show(screen, note) {
+  $("login").classList.toggle("hidden", screen !== "login");
+  $("pwForm").classList.toggle("hidden", screen !== "password");
+  $("app").classList.toggle("hidden", screen !== "app");
+  if (screen === "password") {
+    $("pwForm").reset();
+    $("pwUser").value = me ? me.username : "";
+    $("pwNote").textContent = note || "";
+    $("pwCancel").classList.toggle("hidden", !!(me && me.must_change));
+    $("pwMsg").textContent = "";
+    $("pwCur").focus();
+  }
+  if (screen === "login") { $("pass").value = ""; $("user").focus(); }
+}
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? { credentials: "same-origin" } : {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return { status: res.status, data };
+}
+
+function afterLogin(user) {
+  me = user;
+  $("whoami").textContent = user.username;
+  if (user.must_change) show("password", "You are using the default password. Choose a new one to continue.");
+  else { show("app"); connect(); }
+}
+
+function disconnect() {
+  if (client) { client.end(true); client = null; }
+  setConn("Disconnected");
+}
+
+async function sessionLost() {
+  const { status } = await api("/api/me");
+  if (status === 401) { disconnect(); me = null; show("login"); $("loginMsg").textContent = "Session expired, please log in again"; }
+}
+
+function connect() {
   if (client) client.end(true);
   setConn("Connecting…");
-  $("loginMsg").textContent = "";
-  const url = `wss://${location.host}/mqtt`;
-  client = mqtt.connect(url, { username: user, password: pass, reconnectPeriod: 5000, connectTimeout: 10000,
-                               clientId: "web-" + Math.random().toString(16).slice(2, 10) });
+  // No MQTT credentials: the session cookie authorizes the WebSocket (checked by Caddy).
+  client = mqtt.connect(`wss://${location.host}/mqtt`, { reconnectPeriod: 5000, connectTimeout: 10000,
+                        clientId: "web-" + Math.random().toString(16).slice(2, 10) });
   client.on("connect", () => {
     setConn("Connected", "ok");
-    $("login").classList.add("hidden");
-    $("app").classList.remove("hidden");
     client.subscribe([`${BASE}/state`, `${BASE}/status`], { qos: 1 });
+    dirty.forEach((d, i) => { if (d && !pending[i]) autoSave(i); });   // send edits made while offline
   });
   client.on("message", (topic, msg) => {
     const s = msg.toString();
@@ -237,28 +358,45 @@ function connect(user, pass) {
       try { state = JSON.parse(s); render(); } catch (e) {}
     }
   });
-  client.on("error", (err) => {
-    setConn("Error", "bad");
-    $("loginMsg").textContent = /auth|Not authorized|Bad user/i.test(err.message) ? "Wrong username or password" : err.message;
-    if (/auth|Not authorized|Bad user/i.test(err.message)) { client.end(true); store("irr.pass", null); }
-  });
-  client.on("close", () => setConn("Disconnected", "bad"));
+  client.on("error", () => setConn("Error", "bad"));
+  client.on("close", () => { setConn("Disconnected", "bad"); sessionLost(); });
 }
 
-$("connectBtn").onclick = () => {
-  const user = $("user").value.trim(), pass = $("pass").value;
-  if ($("remember").checked) { store("irr.user", user); store("irr.pass", pass); }
-  connect(user, pass);
-};
-$("logout").onclick = (e) => {
-  e.preventDefault(); store("irr.pass", null);
-  if (client) client.end(true);
-  $("app").classList.add("hidden"); $("login").classList.remove("hidden"); setConn("Disconnected");
+$("login").onsubmit = async (e) => {
+  e.preventDefault();
+  $("loginMsg").textContent = "";
+  const username = $("user").value.trim();
+  const { status, data } = await api("/api/login", { username, password: $("pass").value });
+  if (status === 200) { store("irr.user", username); afterLogin(data); }
+  else { $("pass").value = ""; $("loginMsg").textContent = data.error || "Login failed"; }
 };
 
-const savedUser = load("irr.user"), savedPass = load("irr.pass");
-if (savedUser) $("user").value = savedUser;
-if (savedUser && savedPass) connect(savedUser, savedPass);
+$("pwForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const msg = $("pwMsg");
+  msg.textContent = "";
+  if ($("pwNew").value !== $("pwNew2").value) { msg.textContent = "New passwords do not match"; return; }
+  const { status, data } = await api("/api/password", { current: $("pwCur").value, new: $("pwNew").value });
+  if (status === 200) { afterLogin(data); }
+  else if (status === 401) { me = null; show("login"); $("loginMsg").textContent = "Session expired, please log in again"; }
+  else msg.textContent = data.error || "Could not change password";
+};
+$("pwCancel").onclick = () => show("app");
+$("changePw").onclick = (e) => { e.preventDefault(); show("password"); };
+
+$("logout").onclick = async (e) => {
+  e.preventDefault();
+  disconnect();
+  await api("/api/logout", {});
+  me = null; state = null;
+  show("login");
+};
+
+// Forget credentials saved by the earlier (MQTT-login) version of this page
+store("irr.pass", null);
+const savedUser = load("irr.user");
+if (savedUser && savedUser !== "web") $("user").value = savedUser;
+api("/api/me").then(({ status, data }) => status === 200 ? afterLogin(data) : show("login"));
 </script>
 </body>
 </html>

@@ -9,7 +9,7 @@ mkdir -p "$DST"
 if ! cmp -s "$SRC/$HOST.crt" "$DST/fullchain.pem" || ! cmp -s "$SRC/$HOST.key" "$DST/privkey.pem"; then
   install -m 644 -o root -g mosquitto "$SRC/$HOST.crt" "$DST/fullchain.pem"
   install -m 640 -o root -g mosquitto "$SRC/$HOST.key" "$DST/privkey.pem"
-  [ -f /etc/mosquitto/conf.d/irrigation-tls.conf ] || cp /opt/irrigation/mosquitto/tls.conf /etc/mosquitto/conf.d/irrigation-tls.conf
+  [ -f /etc/mosquitto/conf.d/20-irrigation-tls.conf ] || cp /opt/irrigation/mosquitto/tls.conf /etc/mosquitto/conf.d/20-irrigation-tls.conf
   systemctl restart mosquitto
   echo "certificate updated, mosquitto restarted"
 fi

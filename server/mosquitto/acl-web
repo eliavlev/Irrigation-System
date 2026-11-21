@@ -1,0 +1,2 @@
+# Dashboard clients on the local WebSocket listener (already logged in via irrigation-auth)
+topic readwrite irrigation/#
