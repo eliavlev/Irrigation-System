@@ -1,0 +1,20 @@
+# Irrigation dashboard + MQTT-over-WebSocket proxy (appended to /etc/caddy/Caddyfile by setup.sh)
+__HOST__ {
+	# Let's Encrypt only, so the NodeMCU's bundled ISRG root certificates always match
+	tls {
+		issuer acme
+	}
+	encode gzip
+	handle /mqtt {
+		reverse_proxy 127.0.0.1:9001
+	}
+	handle {
+		root * /srv/irrigation
+		file_server
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}

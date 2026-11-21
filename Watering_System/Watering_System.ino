@@ -1,891 +1,492 @@
-
 /*
 #####################################################################################
-#   File:               Arduino_Watering_sustem.ino                                             
-#       Processor:          Arduino UNO      
-#   Language:     Wiring / C /Processing /Fritzing / Arduino IDE          
-#           
-# Objectives:         Watering System - Irrigation using Blynk and NodeMCU (ESP8266-12E)
-#                     
-# Behavior:     Based on Blynk time schedule
-#                           
-#     
-#   Author:                 Eliav Levinson 
-#   Date:                   30/12/16  
-#   place:                   
-#         
+#   File:        Watering_System.ino
+#   Processor:   NodeMCU v3 (ESP8266 / ESP-12E)
+#   Objectives:  Irrigation controller for 3 valves, controlled over MQTT
+#   Author:      Eliav Levinson
+#   Date:        30/12/16 (original Blynk version), MQTT version 2026
 #####################################################################################
- 
+
   This project contains public domain code.
   The modification is allowed without notice.
-  
- // libraries definition
 
-/* BLYNK Definitions & Libraries */
+  The controller is self-sufficient: schedules, rain mode and manual duration are
+  stored in flash, and the clock comes from NTP, so watering keeps running when the
+  MQTT broker or the internet is down. MQTT is used to change settings and report state.
 
+  MQTT topics (prefix irrigation/<DEVICE_ID>):
+    set/valve/<1-3>/schedule  retained  {"start":360,"stop":380,"days":[0,1,0,1,0,1,0]}
+                                         start/stop = minutes since midnight (-1 = off),
+                                         days = Sun..Sat
+    set/valve/<1-3>/manual              "1" start a manual run, "0" stop it
+    set/rain                  retained  "1" rain mode on (schedules paused), "0" off
+    set/manual_minutes        retained  manual run duration in minutes
+    state                     retained  JSON snapshot published by the device
+    status                    retained  "online" / "offline" (last will)
+*/
+
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <WiFiUdp.h>
-#include <TimeLib.h>
-#include <time.h>      // ESP8266 SNTP (fallback clock when Blynk is unreachable)
-//#include <BlynkSimpleEsp8266_SSL.h>
-#include <BlynkSimpleEsp8266.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
 #include <Wire.h>
-#include <SoftwareSerial.h>  
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <SimpleTimer.h>
-#include "FS.h"
-#include <ArduinoOTA.h>
-#include <WidgetRTC.h>
-#include "secrets.h"   // Credentials live here (git-ignored). Copy secrets.h.example to create it.
+#include <FS.h>
+#include "secrets.h"     // Credentials (git-ignored). Copy secrets.h.example to create it.
+#include "ca_certs.h"
 
-// You should get Auth Token in the Blynk App.
-// Go to the Project Settings (nut icon).
-char auth[] = SECRET_BLYNK_AUTH;
+#ifndef SECRET_MQTT_HOST
+#error "secrets.h is missing the MQTT settings - compare it with secrets.h.example"
+#endif
 
-// Your WiFi credentials.
-// Set password to "" for open networks.
-char ssid[] = SECRET_WIFI_SSID;
-char pass[] = SECRET_WIFI_PASS;
-char server[]= "blynk-cloud.com";
-unsigned int port = 8442;
+//------------------------------------------------------------------------------------
+// Configuration
+//------------------------------------------------------------------------------------
+#define ON  0                       // relay modules are active LOW
+#define OFF 1
+#define NUM_VALVES 3
+#define UNSET_TIME 2500             // never matches a real time: valve slot is off
 
-#define RELAY1 12  //D6
-#define RELAY2 14  //D5  (13=D7 14=D5)
-#define RELAY3 2  //D4
-#define WIFI_CONNECT_TIMEOUT_MS    20000UL   // max wait for WiFi at boot
-#define WIFI_FORCE_RECONNECT_MS   300000UL   // force WiFi.reconnect() after 5 min down
-#define BLYNK_RECONNECT_TIMEOUT_MS  3000UL   // max block per Blynk reconnect attempt
-// Local time zone (POSIX TZ string) used ONLY for the NTP fallback clock, when the
-// Blynk RTC is unreachable. Must match the time zone set in the Blynk RTC widget.
-// Default: Israel (IST/IDT). Examples: "CET-1CEST,M3.5.0,M10.5.0/3" (Central Europe),
-// "EST5EDT,M3.2.0,M11.1.0" (US Eastern), "UTC0".
-#define LOCAL_TZ   "IST-2IDT,M3.4.4/26,M10.5.0"
+#define WIFI_CONNECT_TIMEOUT_MS   20000UL
+#define WIFI_FORCE_RECONNECT_MS  300000UL
+#define MQTT_RETRY_MS             15000UL
+#define WATERING_CHECK_MS          5000UL
+#define MOISTURE_CHECK_MS         30000UL
+#define STATE_PUBLISH_MS          60000UL
+#define DEFAULT_MANUAL_MINUTES    10
+
+// Local time zone (POSIX TZ string). Default: Israel (IST/IDT).
+// Examples: "CET-1CEST,M3.5.0,M10.5.0/3" (Central Europe), "EST5EDT,M3.2.0,M11.1.0" (US Eastern).
+#define LOCAL_TZ    "IST-2IDT,M3.4.4/26,M10.5.0"
 #define NTP_SERVER1 "pool.ntp.org"
 #define NTP_SERVER2 "time.google.com"
-#define ON 0
-#define OFF 1
-//#define BLYNK_PRINT Serial
-#define OLED_RESET LED_BUILTIN
 
+const int moistureSensorPin = A0;
 
-//#define OLED_RESET LED_BUILTIN
-Adafruit_SSD1306 display(OLED_RESET);
+//------------------------------------------------------------------------------------
+// State
+//------------------------------------------------------------------------------------
+struct Valve {
+  uint8_t pin;
+  int start;                        // minutes since midnight, UNSET_TIME = off
+  int stop;
+  uint8_t days[8];                  // [0]=valve id, [1..7]=Sun..Sat (same layout as old flash files)
+  bool manual;
+  unsigned long manualStart;
+  bool on;
+};
 
+Valve valves[NUM_VALVES] = {
+  {12, UNSET_TIME, UNSET_TIME, {1,0,0,0,0,0,0,0}, false, 0, false},   // Valve1: D6
+  {14, UNSET_TIME, UNSET_TIME, {2,0,0,0,0,0,0,0}, false, 0, false},   // Valve2: D5
+  { 2, UNSET_TIME, UNSET_TIME, {3,0,0,0,0,0,0,0}, false, 0, false},   // Valve3: D4
+};
 
-
-// A UDP instance to let us send and receive packets over UDP
-WiFiUDP Udp;
-
-WidgetRTC rtc;  //Blynk Real Time Clock Widget
-
-
-// Init NTP time 
-////----------------------------------------------------------------------------------
-//unsigned int localPort = 8888;      // local port to listen for UDP packets
-////String timeString=String();
-////IPAddress timeServerIP; // This will store the timeserver ip address
-//static const char ntpServerName[] = "0.europe.pool.ntp.org";
-//const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
-//byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
-//time_t prevDisplay = 0; // when the digital clock was displayed
-//int timeZoneOffset = 3; // set this to the offset in hours to your local time;
-
-
-// the timer object
-SimpleTimer timer;  
-
-//--------------------------------------------------------------------------------------
-// pins definition
-int levelSensorPin = 0;
-int moistureSensorPin= A0;
-int moistureSensorValue =0;
-int sensorValue=0;
-int timeVal;  
-
-char digitalTime[25];  // The current time in ISO format is being stored here
-#define WEEK_ARRAY_LEN 8   // [0]=valve id, [1..7]=Sun..Sat (TimeLib weekday())
-uint8_t WeekDays_Valve1[WEEK_ARRAY_LEN]={1,0,0,0,0,0,0,0}; 
-uint8_t WeekDays_Valve2[WEEK_ARRAY_LEN]={2,0,0,0,0,0,0,0};
-uint8_t WeekDays_Valve3[WEEK_ARRAY_LEN]={3,0,0,0,0,0,0,0};
-int StartTime_Valve1=0;
-int StartTime_Valve2=0;
-int StartTime_Valve3=0;
-int StopTime_Valve1=0;
-int StopTime_Valve2=0;
-int StopTime_Valve3=0;
+bool rainMode = false;
+int manualMinutes = DEFAULT_MANUAL_MINUTES;
+int moistureValue = 0;
 bool spiffsActive = false;
+bool oledOk = false;
+bool stateDirty = true;
 
-#define DEFAULT_MANUAL_DURATION_MS (10UL * 60UL * 1000UL)    // used until V19 is received
-unsigned long ManualWaterDuration = DEFAULT_MANUAL_DURATION_MS;  // manual watering duration in ms (set from V19 in minutes)
-unsigned long ManualStart[3] = {0, 0, 0};                        // millis() when each manual run started
-int RainModeState=0;   //Rain Mode Button
-int Relay1_buttonState=0;  //Set default Virtual Button state to OFF by default
-int Relay2_buttonState=0;
-int Relay3_buttonState=0;
-int Relay4_buttonState=0;
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
-BLYNK_CONNECTED() {
-  // Synchronize time on connection
-  rtc.begin();
-  // Push the device's real manual-button states to the server before any syncAll().
-  // Otherwise a stale "1" (e.g. a shut-off sent while offline was lost) would
-  // be synced back and re-open the valve.
-  Blynk.virtualWrite(V21, Relay1_buttonState);
-  Blynk.virtualWrite(V22, Relay2_buttonState);
-  Blynk.virtualWrite(V23, Relay3_buttonState);
+BearSSL::WiFiClientSecure net;
+BearSSL::X509List trustAnchors;
+PubSubClient mqtt(net);
+
+String topicBase;                   // irrigation/<DEVICE_ID>
+
+//------------------------------------------------------------------------------------
+// Flash storage (file names kept from the Blynk version so saved schedules survive)
+//------------------------------------------------------------------------------------
+int ReadIntFromFlash(const String& filename, int fallback){
+  if (!spiffsActive || !SPIFFS.exists(filename)) return fallback;
+  File f = SPIFFS.open(filename, "r");
+  if (!f) return fallback;
+  String s;
+  while (f.position() < f.size()) {          // last line wins (matches old format)
+    s = f.readStringUntil('\n');
+    s.trim();
+  }
+  f.close();
+  return s.length() ? s.toInt() : fallback;
 }
 
-  
-void setup() {
-// serial initialization
-  Serial.begin(9600);
-  Serial.println(); 
-
-
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY2, OUTPUT);
-  pinMode(RELAY3, OUTPUT);
-  digitalWrite(RELAY1, OFF);
-  digitalWrite(RELAY2, OFF);
-  digitalWrite(RELAY3, OFF);
-  //digitalWrite(RELAY4, LOW);
-
-   
-// Start filing subsystem
-  if (SPIFFS.begin()) {
-      Serial.println("SPIFFS Active");
-      Serial.println();
-      spiffsActive = true;
-  } else {
-      Serial.println("Unable to activate SPIFFS");
-  }
-
-/*
-// Port defaults to 8266
-  ArduinoOTA.setPort(8277);
-//Hostname defaults to esp8266-[ChipID]
-  ArduinoOTA.setHostname("WaterESP8266");
-
-// No authentication by default
-  ArduinoOTA.setPassword((const char *)OTA_PASSWORD);  // define OTA_PASSWORD in secrets.h
- 
-  ArduinoOTA.onStart([]() {
-      Serial.println("Start");
-    });
-    ArduinoOTA.onEnd([]() {
-      Serial.println("\nEnd");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
-  ArduinoOTA.begin();
-  Serial.println("OTA Success");
-*/
-  Wire.begin();
-// initialize Oled display with the I2C addr 0x3D (for the 128x64)
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false);  
-// Show image buffer on the display hardware.
-// Since the buffer is intialized with an Adafruit splashscreen
-// internally, this will display the splashscreen.
-  display.display();
-  delay(500);
-
-// Clear the display buffer.
-  display.clearDisplay();
-  
-// Connecting to a WiFi network
-//--------------------------------------------------------------------
-  // Let the ESP8266 SDK handle reconnects itself, and don't rewrite the
-  // credentials to flash on every boot.
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid, pass);
-
-  // Wait a bounded time: if the router is down, keep booting so the
-  // controller still runs (manual buttons, saved schedule once time is known).
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
-    delay(500);
-    Serial.print(".");
-   }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected");
-    Serial.print("IP number assigned by DHCP is:  ");
-    Serial.println(WiFi.localIP());
-    PrintToLCD("WiFi connected",1,20);
-  } else {
-    Serial.println("WiFi not available - continuing offline, will keep retrying");
-    PrintToLCD("WiFi offline",1,20);
-  }
-  display.display();
-  delay(2500);
-  //Serial.println("Starting UDP");
-  //Udp.begin(localPort);
-  //Serial.print("Local port: ");
-  //Serial.println(Udp.localPort());
-
-  // Set the sync provider & timesync interval
-  //setSyncProvider(getNtpTime);
-  //setSyncInterval(300); //Sync to NTP server every 5 minutes
-  setSyncInterval(10 * 60); // Sync interval in seconds (10 minutes)
-
-  // Start SNTP in the background as a fallback time source. Blynk RTC stays the
-  // primary source; NTP is only used if the clock is still unset (see EnsureClock()).
-  configTime(0, 0, NTP_SERVER1, NTP_SERVER2);
-  setenv("TZ", LOCAL_TZ, 1);
-  tzset();
-  
-// Read default watering time from FLASH
-  StartTime_Valve1=LoadScheduleTime("StartMin_v1", "Start_v1");
-  StopTime_Valve1=LoadScheduleTime("StopMin_v1", "Stop_v1");
-  StartTime_Valve2=LoadScheduleTime("StartMin_v2", "Start_v2");
-  StopTime_Valve2=LoadScheduleTime("StopMin_v2", "Stop_v2");
-  StartTime_Valve3=LoadScheduleTime("StartMin_v3", "Start_v3");
-  StopTime_Valve3=LoadScheduleTime("StopMin_v3", "Stop_v3");
-  ReadFromFlash2("WeekV1",WeekDays_Valve1);
-  for(int i=0;i<8;i++){
-   Serial.print(WeekDays_Valve1[i]);
-  };
-  Serial.println();
-  ReadFromFlash2("WeekV2",WeekDays_Valve2);
-  for(int i=0;i<8;i++){
-   Serial.print(WeekDays_Valve2[i]);
-  };
-  Serial.println();
-  ReadFromFlash2("WeekV3",WeekDays_Valve3);
-for(int i=0;i<8;i++){
-   Serial.print(WeekDays_Valve3[i]);
-  };
-  Serial.println();
-
-
-
-  
-// Setup BLYNK code
- // Blynk.begin(auth, ssid, pass);
- Blynk.config(auth, server, port);
- if (WiFi.status() == WL_CONNECTED && Blynk.connect(10000)) {
-   Serial.println("Connected to Blynk server");
-   Blynk.syncAll();
- } else {
-   Serial.println("Blynk server not reachable - will retry in background");
- }
- //Blynk.syncVirtual(V1);
- //delay (1000);
- //Blynk.syncVirtual(V2);
- //delay(1000);
- //Blynk.syncVirtual(V3);
- //delay(1000);
- //Blynk.syncVirtual(V4);
- 
-
-
-/*  This replaces NTP sync procedure
-// Attach to Real Time Clock Widget
-BLYNK_ATTACH_WIDGET(rtc, V10);
-// Begin synchronizing time
-  rtc.begin();
-*/
-
-timer.setInterval(5007, WateringCheck);
-timer.setInterval(32005,CheckMoisture);
-timer.setInterval(10009,checkWifiStatus);
-timer.setInterval(30003, CheckConnection); // check if still connected 
-//timer.setInterval(600000, SetTimeZone);
-
+void WriteIntToFlash(const String& filename, int value){
+  if (!spiffsActive) return;
+  File f = SPIFFS.open(filename, "w");
+  if (!f) { Serial.println("Unable to write " + filename); return; }
+  f.println(value);
+  f.close();
 }
 
-
-//---------------------------------------------------------------------------------------
-//  Loop
-//---------------------------------------------------------------------------------------
-void loop() {
-  
- timer.run();
- 
- // Runs the Blynk interface for remote control
-  Blynk.run();
-  
- // Get UTC time
-// if (timeStatus() != timeNotSet) {
-//    if (now() != prevDisplay) { //update the display only if time has changed
-//      prevDisplay = now();
-//      }
-//  }
-  //ArduinoOTA.handle();
-  
- }
-
-
-//---------------------------------------------------------------------------------
-// Function Declerations
-//---------------------------------------------------------------------------------
-void CheckConnection(){    // check every 30s if connected to Blynk server
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Blynk check skipped: WiFi not connected");
-    return;                 // no point blocking on a connect attempt without WiFi
-  }
-  if(!Blynk.connected()){
-    Serial.println("Not connected to Blynk server"); 
-    if (Blynk.connect(BLYNK_RECONNECT_TIMEOUT_MS)) {   // short timeout so valves/timers aren't stalled
-      Serial.println("Reconnected to Blynk server");
-      Blynk.syncAll();
-    } else {
-      Serial.println("Blynk reconnect failed");
-    }
-  }
-  else{
-    Serial.println("Connected to Blynk server");
-       
-  }
+bool ReadDaysFromFlash(const String& filename, uint8_t days[8]){
+  if (!spiffsActive || !SPIFFS.exists(filename)) return false;
+  File f = SPIFFS.open(filename, "r");
+  if (!f) return false;
+  f.read(days, 8);
+  f.close();
+  return true;
 }
 
-void CheckMoisture(){
-
-  // reads the sensors
-  // Using capcitive water sensor Dry=728, Wet=452
-  moistureSensorValue = analogRead(moistureSensorPin);
-  Serial.print("Moisture: ");
-  Serial.println(moistureSensorValue);
-  Blynk.virtualWrite(V0, moistureSensorValue);
-  
+void WriteDaysToFlash(const String& filename, const uint8_t days[8]){
+  if (!spiffsActive) return;
+  File f = SPIFFS.open(filename, "w");
+  if (!f) { Serial.println("Unable to write " + filename); return; }
+  f.write(days, 8);
+  f.close();
 }
-
-BLYNK_WRITE(V1) {  // Get watering scheduling for valve1
-  TimeInputParam t(param);
-
-  // Process start time
-  if (t.hasStartTime())
-  {
-   StartTime_Valve1 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
-   Serial.print("Start V1: " );
-   Serial.println (StartTime_Valve1);
-  
-  // Write START TIME to Flash
-   WriteToFlash("StartMin_v1",StartTime_Valve1);
-   
-  }
-  // Process stop time
-  if (t.hasStopTime())
-  {
-   StopTime_Valve1 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
-   Serial.print("Stop V1: ");
-   Serial.println(StopTime_Valve1);
-   
-   // Write STOP TIME to Flash
-   WriteToFlash("StopMin_v1",StopTime_Valve1);
-    
-  }
- 
-  // Process weekdays (1. Mon, 2. Tue, 3. Wed, ...)
-  for (int i = 1; i <= 6; i++) {
-    if (t.isWeekdaySelected(i)) {
-      WeekDays_Valve1[i+1]=1;
-      Serial.println(String("Day ") + (i+1) + " is selected");
-      }
-        
-    else{
-      WeekDays_Valve1[i+1]=0;
-    }
-  }
-  if (t.isWeekdaySelected(7)){     //Blynk Sunday enumeration is 7. Convert to 1.
-      WeekDays_Valve1[1]=1;
-      Serial.println(String("Day ") + (1) + " is selected");
-    }
-  else {
-      WeekDays_Valve1[1]=0;
-    }
-
-  WriteToFlash2("WeekV1", WeekDays_Valve1); ////////////////////////////////////////////
-  
-  Serial.println();
-}
-//-----------------------
-BLYNK_WRITE(V2) {  // Get watering scheduling for valve2
-  TimeInputParam t(param);
-
-  // Process start time
-  if (t.hasStartTime())
-  {
-    StartTime_Valve2 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
-   Serial.print("Start V2: " );
-   Serial.println (StartTime_Valve2);
-  
-  // Write START TIME to Flash
-   WriteToFlash("StartMin_v2",StartTime_Valve2);
-   
-  }
-  // Process stop time
-  if (t.hasStopTime())
-    {
-    StopTime_Valve2 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
-   Serial.print("Stop V2: ");
-   Serial.println(StopTime_Valve2);
-
-   // Write STOP TIME to Flash
-   WriteToFlash("StopMin_v2",StopTime_Valve2);
-   }
-   
-  // Process weekdays (1. Mon, 2. Tue, 3. Wed, ...)
-  for (int i = 1; i <= 6; i++) {
-    if (t.isWeekdaySelected(i)) {
-      WeekDays_Valve2[i+1]=1;
-      Serial.println(String("Day ") + (i+1) + " is selected");
-    }
-    else{
-      WeekDays_Valve2[i+1]=0;
-    }
-  }
-  if (t.isWeekdaySelected(7)){     //Blynk Sunday enumeration is 7. Convert to 1.
-      WeekDays_Valve2[1]=1;
-      Serial.println(String("Day ") + (1) + " is selected");
-    }
-  else {
-      WeekDays_Valve2[1]=0;
-    }
-
-  WriteToFlash2("WeekV2", WeekDays_Valve2); ////////////////////////////////////////////
-  Serial.println();
-}
-//---------------------------------------------
-
-BLYNK_WRITE(V3) {  // Get watering scheduling for valve3
-  TimeInputParam t(param);
-
-  // Process start time
-  if (t.hasStartTime())
-  {
-   StartTime_Valve3 = t.getStartHour()*60 + t.getStartMinute();   // minutes since midnight
-   Serial.print("Start V3: " );
-   Serial.println (StartTime_Valve3);
-  
-  // Write START TIME to Flash
-   WriteToFlash("StartMin_v3",StartTime_Valve3);
-   
-  }
-  // Process stop time
-  if (t.hasStopTime())
-  {
-   StopTime_Valve3 = t.getStopHour()*60 + t.getStopMinute();     // minutes since midnight
-   Serial.print("Stop V3: ");
-   Serial.println(StopTime_Valve3);
-  
-  // Write STOP TIME to Flash
-   WriteToFlash("StopMin_v3",StopTime_Valve3);
-  
-  }
- 
-  // Process weekdays (1. Mon, 2. Tue, 3. Wed, ...)
-  for (int i = 1; i <= 6; i++) {
-    if (t.isWeekdaySelected(i)) {
-      WeekDays_Valve3[i+1]=1;
-      Serial.println(String("Day ") + (i+1) + " is selected");
-    }
-    else{
-      WeekDays_Valve3[i+1]=0;
-    }
-  }
-  if (t.isWeekdaySelected(7)){     //Blynk Sunday enumeration is 7. Convert to 1.
-      WeekDays_Valve3[1]=1;
-      Serial.println(String("Day ") + (1) + " is selected");
-    }
-  else {
-      WeekDays_Valve3[1]=0;
-    }
-  WriteToFlash2("WeekV3", WeekDays_Valve3); ////////////////////////////////////////////
-  Serial.println();
-}
-
-BLYNK_WRITE(V19){  //Read manual watering duration (minutes)
-    long minutes = param.asInt();
-    ManualWaterDuration = (minutes > 0) ? (unsigned long)minutes * 60UL * 1000UL : DEFAULT_MANUAL_DURATION_MS;
-    }
-
-BLYNK_WRITE(V20){  //Read Rain Mode state from Blynk App
-    RainModeState=param.asInt();
-    }
-
-// Manual watering buttons. Each press (re)starts the run; the run is ended by
-// CheckManualTimeouts() based on millis(), so no timer slots are consumed.
-void SetManual(int &buttonState, int idx, int value){
-    if (value == 1 && buttonState == 0) ManualStart[idx] = millis();  // start only on OFF->ON, so a resync doesn't extend a run
-    buttonState = (value == 1) ? 1 : 0;
-   }
-
-BLYNK_WRITE(V21){ SetManual(Relay1_buttonState, 0, param.asInt()); }
-BLYNK_WRITE(V22){ SetManual(Relay2_buttonState, 1, param.asInt()); }
-BLYNK_WRITE(V23){ SetManual(Relay3_buttonState, 2, param.asInt()); }
-
-void ExpireManual(int &buttonState, int idx, int vpin){
-  if (buttonState == 1 && millis() - ManualStart[idx] >= ManualWaterDuration){
-    buttonState = 0;
-    Blynk.virtualWrite(vpin, 0);   // if offline, BLYNK_CONNECTED() resyncs the button on reconnect
-    }
-  }
-
-void CheckManualTimeouts(){
-  ExpireManual(Relay1_buttonState, 0, V21);
-  ExpireManual(Relay2_buttonState, 1, V22);
-  ExpireManual(Relay3_buttonState, 2, V23);
-  }
- 
-
-//---------------------------------------------
-  
-//  Date & Time Based watering logic
-void WateringCheck(){
-  
-  CheckManualTimeouts();
-  EnsureClock();
-  display.clearDisplay();
-  
-  timeVal = hour()*60 + minute();   // minutes since midnight
-  Serial.println("timeval: ");
-  Serial.println (timeVal);
-  Serial.println("Watering Check Running");
-
-  // Until the Blynk RTC has set the clock, TimeLib reports 1970-01-01 00:00 (a Thursday).
-  // Don't run the schedule on that fake time; manual watering still works.
-  bool clockValid = (timeStatus() != timeNotSet);
-  if (!clockValid) {
-    Serial.println("Clock not set yet - scheduled watering disabled");
-  }
-  // if valve 1=True & current weekday = Active watering days & current time within watering time interval or Manual Button Pressed 
-  if (((clockValid && WeekDays_Valve1[0]==1 && InWindow(StartTime_Valve1, StopTime_Valve1, WeekDays_Valve1))and (RainModeState==0)) or (Relay1_buttonState==1)){
-    Water(RELAY1,"Valve1");
-    Serial.print("Valve 1 Weekday: ");
-    Serial.println(weekday());
-    Serial.println (timeVal);
-    PrintToLCD("Valve1 Watering",0,20);
-    WidgetLED led1(V5); // Valve 1 register to virtual pin 5
-    led1.on();
-    }
-  else {
-    digitalWrite(RELAY1,OFF);           // Turns OFF Relay
-    PrintToLCD("Valve1 STBY",0,20);
-    WidgetLED led1(V5); // Valve 1 register to virtual pin 5
-    led1.off();
-  }
-  if ((clockValid && WeekDays_Valve2[0]==2 && InWindow(StartTime_Valve2, StopTime_Valve2, WeekDays_Valve2) and (RainModeState==0))or (Relay2_buttonState==1)){
-    Serial.print("Valve 2 Watering: ");
-    WidgetLED led2(V6); // Valve 2 register to virtual pin 6
-    led2.on();
-    Water(RELAY2,"Valve2");
-    PrintToLCD("Valve2 Watering",0,30);
-    }
-  else{
-    digitalWrite(RELAY2,OFF);           // Turns OFF Relay
-    PrintToLCD("Valve2 STBY",0,30);
-    WidgetLED led2(V6); // Valve 2 register to virtual pin 6
-    led2.off();
-    }
-  if ((clockValid && WeekDays_Valve3[0]==3 && InWindow(StartTime_Valve3, StopTime_Valve3, WeekDays_Valve3) and (RainModeState==0))or (Relay3_buttonState==1)){
-    Serial.print("Valve 3 Watering: ");
-    WidgetLED led3(V7); // Valve 2 register to virtual pin 7
-    led3.on();
-    Water(RELAY3,"Valve3");
-    PrintToLCD("Valve3 Watering",0,40);
-    }
-  else {
-    digitalWrite(RELAY3,OFF);           // Turns OFF Relay
-    WidgetLED led3(V7); // Valve 2 register to virtual pin 6
-    led3.off();
-    PrintToLCD("Valve3 STBY",0,40);
-   
-    }
-  
-  display.display();
-  }
-
-  
-
-// True if the current time is inside the [start, stop] window (minutes since midnight,
-// stop inclusive) on a selected day. A window with start > stop crosses midnight
-// (e.g. 23:00-01:30); its after-midnight part belongs to the day it started on.
-bool InWindow(int start, int stop, uint8_t days[]){
-  if (start < 0 || start >= 1440 || stop < 0 || stop >= 1440) return false;  // unset (e.g. 2500 sentinel)
-  int nowMin = hour()*60 + minute();
-  int today = weekday();                         // 1=Sun .. 7=Sat
-  if (start <= stop) {
-    return days[today] == 1 && nowMin >= start && nowMin <= stop;
-  }
-  if (nowMin >= start) return days[today] == 1;  // before midnight
-  if (nowMin <= stop) {                          // after midnight: check the previous day
-    int yesterday = (today == 1) ? 7 : today - 1;
-    return days[yesterday] == 1;
-  }
-  return false;
-}
-
-void Water(int relay, String relayName){
-      digitalWrite(relay,ON);           // Turns ON Relay 
-       
-    }
-  
-  
-
-
-//---------------------------------------------------------------
-// send an NTP request to the time server at the given address
-//---------------------------------------------------------------
-
-//time_t getNtpTime(){
-//  IPAddress ntpServerIP; // NTP server's ip address
-//
-//  while (Udp.parsePacket() > 0) ; // discard any previously received packets
-//  Serial.println("Transmit NTP Request");
-//  
-//  // get a random server from the pool
-//  WiFi.hostByName(ntpServerName, ntpServerIP);
-//  Serial.print(ntpServerName);
-//  Serial.print(": ");
-//  Serial.println(ntpServerIP);
-//  
-//  sendNTPpacket(ntpServerIP);
-//  uint32_t beginWait = millis();
-//  
-//  while (millis() - beginWait < 1500) {
-//    int size = Udp.parsePacket();
-//    if (size >= NTP_PACKET_SIZE) {
-//      Serial.println("Receive NTP Response");
-//      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
-//      unsigned long secsSince1900;
-//      // convert four bytes starting at location 40 to a long integer
-//      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
-//      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-//      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-//      secsSince1900 |= (unsigned long)packetBuffer[43];
-//      return secsSince1900 - 2208988800UL + timeZoneOffset * SECS_PER_HOUR;
-//  
-//    }
-//  }
-//  Serial.println("No NTP Response :-(");
-//    return 0; // return 0 if unable to get the time
-//}
-
-
-//// send an NTP request to the time server at the given address
-//void sendNTPpacket(IPAddress &address)
-//{
-//  // set all bytes in the buffer to 0
-//  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-//  // Initialize values needed to form NTP request
-//  // (see URL above for details on the packets)
-//  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-//  packetBuffer[1] = 0;     // Stratum, or type of clock
-//  packetBuffer[2] = 6;     // Polling Interval
-//  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-//  // 8 bytes of zero for Root Delay & Root Dispersion
-//  packetBuffer[12] = 49;
-//  packetBuffer[13] = 0x4E;
-//  packetBuffer[14] = 49;
-//  packetBuffer[15] = 52;
-//  // all NTP fields have been given values, now
-//  // you can send a packet requesting a timestamp:
-//  Udp.beginPacket(address, 123); //NTP requests are to port 123
-//  Udp.write(packetBuffer, NTP_PACKET_SIZE);
-//  Udp.endPacket();
-//}
-
-  
-
-void digitalClockDisplay(){
- //sprintf(digitalTime, "%4d-%02d-%02d %02d:%02d:%02d\n", year(), month(), day(), hour(), minute());  //display second resolution
-  sprintf(digitalTime, "%4d-%02d-%02d %02d:%02d\n", year(), month(), day(), hour(), minute());   //display minute resolution
-  Blynk.virtualWrite(V10, digitalTime);
-}
-
-void displayTime()
-{
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  digitalClockDisplay();
-  display.println(digitalTime);
-  display.display();
- }
-
- void PrintToLCD(const char* phrase, int XOffset, int YOffset)
-{
-  display.setCursor(0,0);
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  digitalClockDisplay();
-  display.println(digitalTime);
-  display.println(" ");
-  display.setCursor(XOffset,YOffset);
-  //display.setTextSize(1);
-  //display.setTextColor(WHITE);
-  display.println(phrase);
-  display.println(" ");
-  //display.display();
-  //display.clearDisplay(); 
- }
-
-int ReadFromFlash(String filename){
-  if (spiffsActive) {
-    if (SPIFFS.exists(filename)) {
-      File f = SPIFFS.open(filename, "r");
-      if (!f) {
-        Serial.print("Unable To Open '");
-        Serial.print(filename);
-        Serial.println(" for Reading");
-        return 2500;
-        } 
-        else {
-        String s;
-        Serial.print("Contents of file ");
-        Serial.print(filename);
-        Serial.println("'");
-        while (f.position()<f.size())
-        {
-          s=f.readStringUntil('\n');
-          s.trim();
-          Serial.println(s.toInt());
-         } 
-        f.close();
-        return (s.toInt()); 
-        }
-          
-        }
-      } 
-  return 2500;   // No SPIFFS / no file yet: 2500 never matches a real time, so the valve stays off
-    }
-
 
 // Load a schedule time (minutes since midnight). Falls back to the pre-v11 file,
-// which stored HHMM with midnight as 24xx, converts it and saves it in the new format,
-// so an existing saved schedule survives the firmware update.
-int LoadScheduleTime(const char* newName, const char* oldName){
-  int v = ReadFromFlash(newName);
+// which stored HHMM with midnight as 24xx, and migrates it.
+int LoadScheduleTime(const String& newName, const String& oldName){
+  int v = ReadIntFromFlash(newName, UNSET_TIME);
   if (v >= 0 && v < 1440) return v;
 
-  int old = ReadFromFlash(oldName);
+  int old = ReadIntFromFlash(oldName, -1);
   int hh = old / 100, mm = old % 100;
   if (hh == 24) hh = 0;
   if (old >= 0 && hh < 24 && mm < 60) {
     v = hh * 60 + mm;
-    Serial.print("Migrated "); Serial.print(oldName);
-    Serial.print(" -> "); Serial.println(newName);
-    WriteToFlash(newName, v);
+    Serial.println("Migrated " + oldName + " -> " + newName);
+    WriteIntToFlash(newName, v);
     return v;
   }
-  return 2500;   // no valid saved time: valve stays off for this slot
+  return UNSET_TIME;
 }
 
-// If the clock was never set by the Blynk RTC (e.g. Blynk server unreachable at
-// boot), set it from NTP so the saved schedule can still run.
-void EnsureClock(){
-  if (timeStatus() != timeNotSet) return;
-  time_t utc = time(nullptr);
-  if (utc < 1609459200) return;          // SNTP has no answer yet (before 2021-01-01)
+void LoadSettings(){
+  for (int i = 0; i < NUM_VALVES; i++) {
+    String n = String(i + 1);
+    valves[i].start = LoadScheduleTime("StartMin_v" + n, "Start_v" + n);
+    valves[i].stop  = LoadScheduleTime("StopMin_v" + n,  "Stop_v" + n);
+    ReadDaysFromFlash("WeekV" + n, valves[i].days);
+    valves[i].days[0] = i + 1;
+    Serial.printf("Valve%d: start=%d stop=%d days=", i + 1, valves[i].start, valves[i].stop);
+    for (int d = 1; d <= 7; d++) Serial.print(valves[i].days[d]);
+    Serial.println();
+  }
+  rainMode = ReadIntFromFlash("RainMode", 0) == 1;
+  manualMinutes = ReadIntFromFlash("ManualMin", DEFAULT_MANUAL_MINUTES);
+  if (manualMinutes <= 0) manualMinutes = DEFAULT_MANUAL_MINUTES;
+}
+
+//------------------------------------------------------------------------------------
+// Clock (NTP via the ESP8266 SDK, local time via TZ rules)
+//------------------------------------------------------------------------------------
+bool ClockValid(){
+  return time(nullptr) > 1609459200;          // after 2021-01-01: SNTP has answered
+}
+
+bool LocalNow(struct tm& lt){
+  if (!ClockValid()) return false;
+  time_t now = time(nullptr);
+  localtime_r(&now, &lt);
+  return true;
+}
+
+// True if the current time is inside the [start, stop] window (minutes since midnight,
+// stop inclusive) on a selected day. A window with start > stop crosses midnight
+// (e.g. 23:00-01:30); its after-midnight part belongs to the day it started on.
+bool InWindow(const Valve& v, const struct tm& lt){
+  if (v.start < 0 || v.start >= 1440 || v.stop < 0 || v.stop >= 1440) return false;
+  int nowMin = lt.tm_hour * 60 + lt.tm_min;
+  int today = lt.tm_wday + 1;                   // 1=Sun .. 7=Sat
+  if (v.start <= v.stop) {
+    return v.days[today] == 1 && nowMin >= v.start && nowMin <= v.stop;
+  }
+  if (nowMin >= v.start) return v.days[today] == 1;
+  if (nowMin <= v.stop) {
+    int yesterday = (today == 1) ? 7 : today - 1;
+    return v.days[yesterday] == 1;
+  }
+  return false;
+}
+
+//------------------------------------------------------------------------------------
+// Display
+//------------------------------------------------------------------------------------
+void UpdateDisplay(){
+  if (!oledOk) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
   struct tm lt;
-  localtime_r(&utc, &lt);
-  setTime(lt.tm_hour, lt.tm_min, lt.tm_sec, lt.tm_mday, lt.tm_mon + 1, lt.tm_year + 1900);
-  Serial.println("Clock set from NTP (Blynk RTC not available)");
+  if (LocalNow(lt)) {
+    display.printf("%04d-%02d-%02d %02d:%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+  } else {
+    display.print("Clock not set");
+  }
+  for (int i = 0; i < NUM_VALVES; i++) {
+    display.setCursor(0, 20 + i * 10);
+    display.printf("Valve%d %s", i + 1, valves[i].on ? (valves[i].manual ? "Manual" : "Watering") : "STBY");
+  }
+  display.setCursor(0, 54);
+  display.printf("%s %s%s", WiFi.status() == WL_CONNECTED ? "WiFi" : "NoWiFi",
+                 mqtt.connected() ? "MQTT" : "NoMQTT", rainMode ? " RAIN" : "");
+  display.display();
 }
 
-// Write START TIME to Flash
-void WriteToFlash(String filename, int timeValue){   
+//------------------------------------------------------------------------------------
+// Watering logic
+//------------------------------------------------------------------------------------
+void WateringCheck(){
+  struct tm lt;
+  bool clockOk = LocalNow(lt);
+  unsigned long manualMs = (unsigned long)manualMinutes * 60UL * 1000UL;
 
-  File f = SPIFFS.open(filename, "w");
-      if (!f) {
-        Serial.print("Unable To Open for writing: ");
-        Serial.println (filename);
-      }
-       else {
-        Serial.println("Writing to file: ");
-        Serial.println(filename);
-        f.println(timeValue);
-        f.close();
-      }
+  for (int i = 0; i < NUM_VALVES; i++) {
+    Valve& v = valves[i];
+    if (v.manual && millis() - v.manualStart >= manualMs) {
+      v.manual = false;
+      Serial.printf("Valve%d manual run finished\n", i + 1);
+      stateDirty = true;
+    }
+    bool scheduled = clockOk && !rainMode && InWindow(v, lt);
+    bool shouldBeOn = scheduled || v.manual;
+    digitalWrite(v.pin, shouldBeOn ? ON : OFF);
+    if (shouldBeOn != v.on) {
+      v.on = shouldBeOn;
+      Serial.printf("Valve%d %s\n", i + 1, v.on ? "ON" : "OFF");
+      stateDirty = true;
+    }
+  }
+  UpdateDisplay();
 }
 
-// Wifi Status Check
+void CheckMoisture(){
+  // Capacitive sensor: dry ~728, wet ~452
+  int value = analogRead(moistureSensorPin);
+  if (abs(value - moistureValue) > 5) stateDirty = true;
+  moistureValue = value;
+}
 
-// The SDK auto-reconnects (setAutoReconnect). This only logs state changes and,
-// as a fallback, nudges a reconnect if WiFi has been down for a long time.
-// It never blocks.
-void checkWifiStatus(){
+//------------------------------------------------------------------------------------
+// MQTT
+//------------------------------------------------------------------------------------
+void PublishState(){
+  if (!mqtt.connected()) return;
+  JsonDocument doc;
+  struct tm lt;
+  if (LocalNow(lt)) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min);
+    doc["time"] = buf;
+  } else {
+    doc["time"] = nullptr;
+  }
+  doc["rain"] = rainMode ? 1 : 0;
+  doc["manual_minutes"] = manualMinutes;
+  doc["moisture"] = moistureValue;
+  doc["rssi"] = WiFi.RSSI();
+  doc["uptime"] = millis() / 1000;
+  doc["heap"] = ESP.getFreeHeap();
+  unsigned long manualMs = (unsigned long)manualMinutes * 60UL * 1000UL;
+  JsonArray arr = doc["valves"].to<JsonArray>();
+  for (int i = 0; i < NUM_VALVES; i++) {
+    const Valve& v = valves[i];
+    JsonObject o = arr.add<JsonObject>();
+    o["on"] = v.on;
+    o["manual"] = v.manual;
+    o["manual_left"] = v.manual ? (long)((manualMs - (millis() - v.manualStart)) / 1000) : 0;
+    o["start"] = (v.start < 1440) ? v.start : -1;
+    o["stop"]  = (v.stop  < 1440) ? v.stop  : -1;
+    JsonArray days = o["days"].to<JsonArray>();
+    for (int d = 1; d <= 7; d++) days.add(v.days[d]);
+  }
+  char payload[700];
+  size_t n = serializeJson(doc, payload, sizeof(payload));
+  mqtt.publish((topicBase + "/state").c_str(), (const uint8_t*)payload, n, true);
+  stateDirty = false;
+}
+
+void ApplySchedule(int idx, const char* json){
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) { Serial.println("Bad schedule JSON"); return; }
+  Valve& v = valves[idx];
+  int start = doc["start"] | -1;
+  int stop  = doc["stop"]  | -1;
+  v.start = (start >= 0 && start < 1440) ? start : UNSET_TIME;
+  v.stop  = (stop  >= 0 && stop  < 1440) ? stop  : UNSET_TIME;
+  JsonArray days = doc["days"];
+  for (int d = 0; d < 7; d++) v.days[d + 1] = (days[d] | 0) ? 1 : 0;
+
+  String n = String(idx + 1);
+  WriteIntToFlash("StartMin_v" + n, v.start);
+  WriteIntToFlash("StopMin_v" + n, v.stop);
+  WriteDaysToFlash("WeekV" + n, v.days);
+  Serial.printf("Valve%d schedule: %d-%d\n", idx + 1, v.start, v.stop);
+}
+
+void OnMqttMessage(char* topic, byte* payload, unsigned int length){
+  String t(topic);
+  String p;
+  p.reserve(length);
+  for (unsigned int i = 0; i < length; i++) p += (char)payload[i];
+  Serial.println("MQTT " + t + " = " + p);
+
+  String prefix = topicBase + "/set/";
+  if (!t.startsWith(prefix)) return;
+  String cmd = t.substring(prefix.length());
+
+  if (cmd.startsWith("valve/")) {
+    int idx = cmd.substring(6, 7).toInt() - 1;          // "valve/<n>/..."
+    if (idx < 0 || idx >= NUM_VALVES) return;
+    String what = cmd.substring(8);
+    if (what == "schedule") {
+      ApplySchedule(idx, p.c_str());
+    } else if (what == "manual") {
+      bool start = (p == "1");
+      if (start) valves[idx].manualStart = millis();      // a new press restarts the timer
+      valves[idx].manual = start;
+    }
+  } else if (cmd == "rain") {
+    rainMode = (p == "1");
+    WriteIntToFlash("RainMode", rainMode ? 1 : 0);
+  } else if (cmd == "manual_minutes") {
+    int m = p.toInt();
+    if (m > 0 && m <= 240) {
+      manualMinutes = m;
+      WriteIntToFlash("ManualMin", m);
+    }
+  }
+  stateDirty = true;
+  WateringCheck();                   // act on the change right away
+}
+
+void MqttConnect(){
+  static unsigned long lastAttempt = 0;
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+  if (!ClockValid()) return;          // TLS certificate checks need the correct time
+  if (lastAttempt && millis() - lastAttempt < MQTT_RETRY_MS) return;
+  lastAttempt = millis();
+
+  Serial.printf("Connecting to MQTT %s:%d ... ", SECRET_MQTT_HOST, SECRET_MQTT_PORT);
+  String clientId = String("irrigation-") + SECRET_DEVICE_ID + "-" + String(ESP.getChipId(), HEX);
+  String statusTopic = topicBase + "/status";
+  if (mqtt.connect(clientId.c_str(), SECRET_MQTT_USER, SECRET_MQTT_PASS,
+                   statusTopic.c_str(), 1, true, "offline")) {
+    Serial.println("connected");
+    mqtt.publish(statusTopic.c_str(), "online", true);
+    mqtt.subscribe((topicBase + "/set/#").c_str(), 1);
+    stateDirty = true;
+  } else {
+    char err[80] = "";
+    net.getLastSSLError(err, sizeof(err));
+    Serial.printf("failed, rc=%d %s\n", mqtt.state(), err);
+  }
+}
+
+//------------------------------------------------------------------------------------
+// WiFi
+//------------------------------------------------------------------------------------
+void CheckWifiStatus(){
   static bool wasConnected = true;
   static unsigned long downSince = 0;
   bool connected = (WiFi.status() == WL_CONNECTED);
-
   if (connected) {
-    if (!wasConnected) {
-      Serial.print("WiFi reconnected, IP: ");
-      Serial.println(WiFi.localIP());
-    }
-  } else {
-    if (wasConnected) {
-      Serial.println("WiFi connection lost");
-      downSince = millis();
-    } else if (millis() - downSince >= WIFI_FORCE_RECONNECT_MS) {
-      Serial.println("WiFi still down - forcing reconnect");
-      WiFi.reconnect();
-      downSince = millis();
-    }
+    if (!wasConnected) Serial.println("WiFi reconnected, IP: " + WiFi.localIP().toString());
+  } else if (wasConnected) {
+    Serial.println("WiFi connection lost");
+    downSince = millis();
+  } else if (millis() - downSince >= WIFI_FORCE_RECONNECT_MS) {
+    Serial.println("WiFi still down - forcing reconnect");
+    WiFi.reconnect();
+    downSince = millis();
   }
   wasConnected = connected;
 }
 
-// Write Weekdays to Flash
-void WriteToFlash2(String filename, uint8_t WeekArray[]){   
+//------------------------------------------------------------------------------------
+// Setup / loop
+//------------------------------------------------------------------------------------
+void setup() {
+  Serial.begin(9600);
+  Serial.println();
 
-  File f = SPIFFS.open(filename, "w");
-      if (!f) {
-        Serial.print("Unable To Open for writing: ");
-        Serial.println (filename);
-      }
-       else {
-        Serial.println("Writing to file: ");
-        Serial.println(filename);
-        f.write((uint8_t *)WeekArray, WEEK_ARRAY_LEN);  // sizeof() on a pointer param is 4, not 8
-        f.close();
-      }
+  for (int i = 0; i < NUM_VALVES; i++) {
+    pinMode(valves[i].pin, OUTPUT);
+    digitalWrite(valves[i].pin, OFF);
+  }
+
+  spiffsActive = SPIFFS.begin();
+  Serial.println(spiffsActive ? "SPIFFS Active" : "Unable to activate SPIFFS");
+  LoadSettings();
+
+  Wire.begin();
+  oledOk = display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false);
+  if (oledOk) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.print("Connecting WiFi...");
+    display.display();
+  }
+
+  Serial.print("Connecting to ");
+  Serial.println(SECRET_WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(SECRET_WIFI_SSID, SECRET_WIFI_PASS);
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected, IP: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("WiFi not available - continuing offline, will keep retrying");
+  }
+
+  configTime(LOCAL_TZ, NTP_SERVER1, NTP_SERVER2);
+
+  topicBase = String("irrigation/") + SECRET_DEVICE_ID;
+  trustAnchors.append(ISRG_ROOT_X1);
+  trustAnchors.append(ISRG_ROOT_X2);
+  net.setTrustAnchors(&trustAnchors);
+  net.setTimeout(10000);
+  mqtt.setServer(SECRET_MQTT_HOST, SECRET_MQTT_PORT);
+  mqtt.setCallback(OnMqttMessage);
+  mqtt.setBufferSize(1024);
+  mqtt.setKeepAlive(30);
+  mqtt.setSocketTimeout(10);
+
+  CheckMoisture();
+  WateringCheck();
 }
 
-int ReadFromFlash2(String filename, uint8_t WeekArray[]){
-  if (spiffsActive) {
-    if (SPIFFS.exists(filename)) {
-      File f = SPIFFS.open(filename, "r");
-      if (!f) {
-        Serial.print("Unable To Open '");
-        Serial.print(filename);
-        Serial.println(" for Reading");
-        return (0);
-        } 
-        else {
-        Serial.print("Contents of file ");
-        Serial.print(filename);
-        Serial.println("'");
-        f.read((uint8_t *)WeekArray, WEEK_ARRAY_LEN);
-        f.close();
-        return (1); 
-        }
-          
-        }
-      } 
-  return 0;      // No SPIFFS / no file yet: keep the array's default (no days selected)
-    }
+void loop() {
+  static unsigned long lastWatering = 0, lastMoisture = 0, lastWifi = 0, lastPublish = 0;
+  static bool clockReported = false;
+  unsigned long now = millis();
 
-// void SetTimeZone(){
-//  if ((month()*100+day())<=323 or (month()*100+day())>=1029){
-//    timeZoneOffset =2;
-//   }
-// }
- 
+  if (!clockReported && ClockValid()) {
+    clockReported = true;
+    Serial.println("Clock set from NTP");
+  }
+
+  MqttConnect();
+  mqtt.loop();
+
+  if (now - lastWatering >= WATERING_CHECK_MS) { lastWatering = now; WateringCheck(); }
+  if (now - lastMoisture >= MOISTURE_CHECK_MS) { lastMoisture = now; CheckMoisture(); }
+  if (now - lastWifi >= 10000UL)               { lastWifi = now; CheckWifiStatus(); }
+
+  if (mqtt.connected() && (stateDirty || now - lastPublish >= STATE_PUBLISH_MS)) {
+    static unsigned long lastDirtyPublish = 0;
+    if (!stateDirty || now - lastDirtyPublish >= 1000UL) {   // at most 1 change-update per second
+      lastDirtyPublish = now;
+      lastPublish = now;
+      PublishState();
+    }
+  }
+}

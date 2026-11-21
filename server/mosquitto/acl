@@ -1,0 +1,7 @@
+# Device: only its own topics
+user garden
+topic readwrite irrigation/garden/#
+
+# Dashboard
+user web
+topic readwrite irrigation/#
